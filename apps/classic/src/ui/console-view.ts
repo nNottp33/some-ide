@@ -1,4 +1,4 @@
-import type { ConsoleLevel } from '../runner/protocol'
+import type { ConsoleLevel } from '@some/runtime-core/runner/protocol'
 import { h } from './dom'
 
 const MAX_LINES = 5000

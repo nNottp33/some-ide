@@ -3,20 +3,18 @@
   "private": true,
   "version": "0.1.0",
   "type": "module",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
   "scripts": {
-    "dev": "vite",
-    "build": "tsc --noEmit && vite build",
-    "preview": "vite preview",
-    "typecheck": "tsc --noEmit",
+    "dev": "npm -w apps/classic run dev --",
+    "build": "npm -w apps/classic run build",
+    "preview": "npm -w apps/classic run preview --",
+    "typecheck": "npm run typecheck --workspaces --if-present && tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
     "test:e2e": "playwright test"
-  },
-  "dependencies": {
-    "es-module-lexer": "^3.0.3",
-    "fflate": "^0.8.3",
-    "monaco-editor": "^0.57.0",
-    "sucrase": "^3.35.1"
   },
   "devDependencies": {
     "@playwright/test": "^1.64.0",

@@ -1,0 +1,17 @@
+{
+  "name": "@some/classic",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "The zero-install web edition of some-ide (also the phone-friendly one).",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@some/runtime-core": "0.1.0",
+    "monaco-editor": "^0.57.0"
+  }
+}

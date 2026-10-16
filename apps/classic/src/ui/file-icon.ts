@@ -1,4 +1,4 @@
-import { languageForPath } from '../core/languages'
+import { languageForPath } from '@some/runtime-core/core/languages'
 import { h, icon } from './dom'
 
 /** Colored text badge per language, e.g. "TS" in blue. */

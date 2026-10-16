@@ -1,7 +1,7 @@
-import { Emitter } from '../core/emitter'
-import type { VirtualFS } from '../core/vfs'
-import { buildPreview } from '../runner/html'
-import type { ConsoleLevel, PreviewMessage } from '../runner/protocol'
+import { Emitter } from '@some/runtime-core/core/emitter'
+import type { VirtualFS } from '@some/runtime-core/core/vfs'
+import { buildPreview } from '@some/runtime-core/runner/html'
+import type { ConsoleLevel, PreviewMessage } from '@some/runtime-core/runner/protocol'
 import { h, iconButton } from './dom'
 
 const PREVIEW_SANDBOX = 'allow-scripts allow-modals allow-forms allow-popups allow-pointer-lock allow-downloads'

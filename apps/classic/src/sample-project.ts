@@ -1,4 +1,4 @@
-import type { ProjectSnapshot } from './core/vfs'
+import type { ProjectSnapshot } from '@some/runtime-core/core/vfs'
 
 /** The starter project shown on first launch (and after "Reset to Sample Project"). */
 export function sampleProject(): ProjectSnapshot {

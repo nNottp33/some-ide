@@ -1,4 +1,4 @@
-import { Emitter } from './emitter'
+import { Emitter } from '@some/runtime-core/core/emitter'
 import { readLocal, writeLocal } from './storage'
 
 export type ThemeName = 'dark' | 'light'

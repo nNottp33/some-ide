@@ -1,5 +1,5 @@
-import { extname, join, normalize } from '../core/path'
-import { importZip, isProbablyBinary } from '../core/zip'
+import { extname, join, normalize } from '@some/runtime-core/core/path'
+import { importZip, isProbablyBinary } from '@some/runtime-core/core/zip'
 
 export interface UploadResult {
   files: Record<string, string>

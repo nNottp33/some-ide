@@ -1,0 +1,19 @@
+{
+  "name": "@some/runtime-core",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Framework-free IDE logic shared by every edition: virtual file system, search, module linking and the JavaScript, Python and HTML runners.",
+  "exports": {
+    "./core/*": "./src/core/*.ts",
+    "./runner/*": "./src/runner/*.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "es-module-lexer": "^3.0.3",
+    "fflate": "^0.8.3",
+    "sucrase": "^3.35.1"
+  }
+}

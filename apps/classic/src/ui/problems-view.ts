@@ -1,5 +1,5 @@
-import { Emitter } from '../core/emitter'
-import { basename, dirname } from '../core/path'
+import { Emitter } from '@some/runtime-core/core/emitter'
+import { basename, dirname } from '@some/runtime-core/core/path'
 import type { DocumentManager } from '../editor/documents'
 import { monaco } from '../editor/monaco'
 import { h, icon } from './dom'

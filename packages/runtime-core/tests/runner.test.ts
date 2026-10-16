@@ -1,4 +1,5 @@
 // @vitest-environment happy-dom
+// @vitest-environment-options { "settings": { "disableCSSFileLoading": true, "disableJavaScriptFileLoading": true } }
 import { describe, expect, it } from 'vitest'
 import { buildPreview, importMapDefines } from '../src/runner/html'
 import { formatArgs, formatTable, inspect } from '../src/runner/inspect'

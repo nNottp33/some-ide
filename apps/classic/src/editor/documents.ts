@@ -1,7 +1,7 @@
-import { Emitter } from '../core/emitter'
-import { languageForPath } from '../core/languages'
-import { isWithin, rebase } from '../core/path'
-import type { FsEvent, VirtualFS } from '../core/vfs'
+import { Emitter } from '@some/runtime-core/core/emitter'
+import { languageForPath } from '@some/runtime-core/core/languages'
+import { isWithin, rebase } from '@some/runtime-core/core/path'
+import type { FsEvent, VirtualFS } from '@some/runtime-core/core/vfs'
 import { monaco } from './monaco'
 
 export interface Document {

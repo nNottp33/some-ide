@@ -73,15 +73,21 @@ npm run preview    # ทดสอบไฟล์ที่ build แล้ว
 
 ## โครงสร้างโค้ด (Project structure)
 
+repo นี้เป็น npm workspaces monorepo แอปเว็บตัวนี้คือรุ่น **Classic** ส่วน logic ที่ไม่ขึ้นกับ UI แยกเป็นแพ็กเกจ
+เพื่อให้รุ่น desktop และมือถือในแผน ([docs/PLAN.md](docs/PLAN.md)) ใช้ร่วมกันได้
+
 ```
-src/
-  core/        ระบบไฟล์เสมือน (vfs), path, storage, settings, search, fuzzy, zip — ไม่ขึ้นกับ UI
-  editor/      ตั้งค่า Monaco, DocumentManager (model ต่อไฟล์ + dirty state), EditorArea (แท็บ)
-  runner/      module linker, JS worker, Python worker, HTML preview builder, console formatter
-  ui/          explorer, search, console, problems, preview, quick input, dialogs
-  workbench.ts ประกอบทุกส่วน: layout, คำสั่ง, คีย์ลัด, การบันทึก
-tests/         unit tests (Vitest)
-e2e/           end-to-end tests (Playwright)
+apps/classic/                 แอปเว็บ (Vite + Monaco)
+  src/core/                   storage (IndexedDB), settings
+  src/editor/                 ตั้งค่า Monaco, DocumentManager (model ต่อไฟล์ + dirty state), EditorArea (แท็บ)
+  src/ui/                     explorer, search, console, problems, preview, quick input, dialogs
+  src/workbench.ts            ประกอบทุกส่วน: layout, คำสั่ง, คีย์ลัด, การบันทึก
+packages/runtime-core/        @some/runtime-core — ไม่มี DOM framework, ใช้ได้ทั้งเว็บ, desktop และมือถือ
+  src/core/                   ระบบไฟล์เสมือน (vfs), path, search, fuzzy, zip, languages
+  src/runner/                 module linker, JS worker, Python worker, HTML preview builder, console formatter
+  tests/                      unit tests (Vitest)
+e2e/                          end-to-end tests (Playwright) ของแอป Classic
+docs/PLAN.md                  แผนสถาปัตยกรรมและ roadmap ของรุ่น desktop/มือถือ
 ```
 
 ## ทดสอบ (Tests)
