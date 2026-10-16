@@ -5,17 +5,18 @@
  * microsoft/vscode `src/vs/platform/terminal/node/terminalEnvironment.ts` (tag 1.141.0):
  *  - bash: `bash --init-file <scripts>/shellIntegration-bash.sh`; the script sources
  *    ~/.bashrc itself when VSCODE_INJECTION=1 (or ~/.bash_profile & co. when VSCODE_SHELL_LOGIN=1).
- *  - zsh:  `zsh -i` with ZDOTDIR pointing to a private, sticky-bit temp directory that holds
- *    copies of the rc/profile/env/login scripts as .zshrc/.zprofile/.zshenv/.zlogin; the
- *    scripts restore the user's own ZDOTDIR (USER_ZDOTDIR) and source the user's files.
+ *  - zsh:  `zsh -i` with ZDOTDIR pointing to a private per-session temp directory (mkdtemp,
+ *    mode 0700, removed when the session exits) that holds copies of the rc/profile/env/login
+ *    scripts as .zshrc/.zprofile/.zshenv/.zlogin; the scripts restore the user's own ZDOTDIR
+ *    (USER_ZDOTDIR) and source the user's files.
  *  - fish: `fish --init-command 'source <scripts>/shellIntegration.fish'`.
  *  - pwsh: `pwsh -noexit -command '. "<scripts>/shellIntegration.ps1"'`.
  * Environment mixin: VSCODE_INJECTION=1, VSCODE_NONCE=<nonce>, VSCODE_STABLE=1 and
  * TERM_PROGRAM=vscode (the scripts check TERM_PROGRAM for a few features).
  */
 import { spawn as ptySpawn, type IPty } from 'node-pty'
-import { chmodSync, copyFileSync, mkdirSync, realpathSync } from 'node:fs'
-import { homedir, tmpdir, userInfo } from 'node:os'
+import { copyFileSync, mkdtempSync, rmSync } from 'node:fs'
+import { homedir, tmpdir } from 'node:os'
 import { basename, dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { randomBytes } from 'node:crypto'
@@ -28,6 +29,8 @@ export interface ShellIntegrationInjection {
   readonly newArgs: string[]
   readonly envMixin: Record<string, string>
   readonly filesToCopy?: { source: string; dest: string }[]
+  /** Private ZDOTDIR created for zsh; the caller removes it when the shell exits. */
+  readonly zdotdir?: string
 }
 
 export interface ShellIntegrationFailure {
@@ -85,17 +88,9 @@ export function getShellIntegrationInjection(
     }
     case 'zsh': {
       if (args.length !== 0 && !areLoginArgs(args)) return { type: 'failure', reason: 'unsupported-args' }
-      let username: string
-      try {
-        username = userInfo().username
-      } catch {
-        username = 'unknown'
-      }
-      const realTmpDir = realpathSync(tmpdir())
-      const zdotdir = join(realTmpDir, `${username}-somed-zsh`)
-      mkdirSync(zdotdir, { recursive: true })
-      // 0o1700: sticky bit, owner rwx, nobody else — same as VS Code.
-      chmodSync(zdotdir, 0o1700)
+      // A fresh, unpredictable directory per session (mkdtemp creates it with mode 0700): a
+      // fixed `$TMPDIR/<user>-somed-zsh` name could be pre-created by another local user.
+      const zdotdir = mkdtempSync(join(tmpdir(), 'somed-zsh-'))
       envMixin.ZDOTDIR = zdotdir
       envMixin.USER_ZDOTDIR = options.userZdotdir ?? process.env.ZDOTDIR ?? homedir()
       const filesToCopy = [
@@ -104,7 +99,7 @@ export function getShellIntegrationInjection(
         { source: join(root, 'shellIntegration-env.zsh'), dest: join(zdotdir, '.zshenv') },
         { source: join(root, 'shellIntegration-login.zsh'), dest: join(zdotdir, '.zlogin') },
       ]
-      return { type: 'injection', newArgs: [login ? '-il' : '-i'], envMixin, filesToCopy }
+      return { type: 'injection', newArgs: [login ? '-il' : '-i'], envMixin, filesToCopy, zdotdir }
     }
     case 'fish': {
       if (args.length !== 0 && !areLoginArgs(args)) return { type: 'failure', reason: 'unsupported-args' }
@@ -142,6 +137,19 @@ export interface SpawnedShell {
   args: string[]
   nonce: string
   injection: ShellIntegrationInjection | ShellIntegrationFailure
+  /** Remove temporary files created for this shell (the zsh ZDOTDIR). Idempotent. */
+  cleanup(): void
+}
+
+/** Remove the temporary files an injection created (safe to call more than once). */
+export function cleanupInjection(injection: ShellIntegrationInjection | ShellIntegrationFailure): void {
+  if (injection.type === 'injection' && injection.zdotdir) {
+    try {
+      rmSync(injection.zdotdir, { recursive: true, force: true })
+    } catch {
+      /* best effort */
+    }
+  }
 }
 
 export function resolveShell(shell: string | undefined): string {
@@ -175,12 +183,18 @@ export function spawnShell(options: SpawnShellOptions = {}): SpawnedShell {
     for (const f of injection.filesToCopy ?? []) copyFileSync(f.source, f.dest)
   }
 
-  const pty = ptySpawn(executable, args, {
-    name: baseEnv.TERM!,
-    cols: options.cols ?? 80,
-    rows: options.rows ?? 24,
-    cwd: options.cwd ?? process.cwd(),
-    env: baseEnv as Record<string, string>,
-  })
-  return { pty, executable, args, nonce, injection }
+  let pty: IPty
+  try {
+    pty = ptySpawn(executable, args, {
+      name: baseEnv.TERM!,
+      cols: options.cols ?? 80,
+      rows: options.rows ?? 24,
+      cwd: options.cwd ?? process.cwd(),
+      env: baseEnv as Record<string, string>,
+    })
+  } catch (err) {
+    cleanupInjection(injection)
+    throw err
+  }
+  return { pty, executable, args, nonce, injection, cleanup: () => cleanupInjection(injection) }
 }

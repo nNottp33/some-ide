@@ -1,6 +1,9 @@
-import { afterAll, beforeAll, describe, expect, it } from 'vitest'
-import { deserializeOscMessage, parseKeyValueAssignment } from '../src/blocks.ts'
-import { getShellIntegrationInjection } from '../src/pty.ts'
+import { existsSync, statSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest'
+import { BlockDetector, SCROLLBACK_CELLS, SCROLLBACK_LINES, deserializeOscMessage, parseKeyValueAssignment, scrollbackFor } from '../src/blocks.ts'
+import { cleanupInjection, getShellIntegrationInjection } from '../src/pty.ts'
 import { hasShell, startShell, type Harness } from './helpers.ts'
 
 describe('OSC 633 message decoding', () => {
@@ -27,14 +30,25 @@ describe('shell integration injection', () => {
     const login = getShellIntegrationInjection('bash', ['-l'], { nonce: 'abc' })
     expect(login.type === 'injection' && login.envMixin.VSCODE_SHELL_LOGIN).toBe('1')
   })
-  it('zsh uses a private ZDOTDIR with the rc files copied', () => {
+  it('zsh uses a private, unpredictable, per-session ZDOTDIR with the rc files copied (removed by cleanup)', () => {
     const r = getShellIntegrationInjection('/usr/bin/zsh', undefined, { nonce: 'n', userZdotdir: '/home/x' })
     expect(r.type).toBe('injection')
     if (r.type !== 'injection') return
     expect(r.newArgs).toEqual(['-i'])
-    expect(r.envMixin.ZDOTDIR).toMatch(/-somed-zsh$/)
+    expect(r.envMixin.ZDOTDIR).toMatch(/somed-zsh-[A-Za-z0-9]{6}$/)
+    expect(r.envMixin.ZDOTDIR.startsWith(tmpdir())).toBe(true)
+    expect(r.zdotdir).toBe(r.envMixin.ZDOTDIR)
+    expect(statSync(r.zdotdir!).mode & 0o777).toBe(0o700)
     expect(r.envMixin.USER_ZDOTDIR).toBe('/home/x')
     expect(r.filesToCopy?.map((f) => f.dest.split('/').pop())).toEqual(['.zshrc', '.zprofile', '.zshenv', '.zlogin'])
+    // A second session gets a different directory (no fixed $TMPDIR/<user>-somed-zsh name to squat on).
+    const r2 = getShellIntegrationInjection('/usr/bin/zsh', undefined, { nonce: 'n' })
+    expect(r2.type === 'injection' && r2.zdotdir).not.toBe(r.zdotdir)
+    cleanupInjection(r)
+    cleanupInjection(r2)
+    cleanupInjection(r) // idempotent
+    expect(existsSync(r.zdotdir!)).toBe(false)
+    expect(existsSync((r2 as { zdotdir?: string }).zdotdir!)).toBe(false)
   })
   it('rejects unsupported shells and args', () => {
     expect(getShellIntegrationInjection('sh', [], { nonce: 'n' })).toEqual({ type: 'failure', reason: 'unsupported-shell' })
@@ -227,6 +241,146 @@ describe('block detection with real bash', () => {
     await h.run("printf '10%%\\r50%%\\r100%%\\n'")
     const b = h.blocks().at(-1)!
     expect(b.output).toBe('100%\n')
+  })
+
+  it('18. a forged OSC 633 P;Cwd printed by a command does not change the cwd', async () => {
+    const before = h.events.length
+    await h.run("printf '\\e]633;P;Cwd=/forged\\a\\e]633;P;HasRichCommandDetection=False\\a'; echo done")
+    expect(h.detector.cwd).toBe('/tmp')
+    expect(h.detector.properties.get('HasRichCommandDetection')).toBe('True')
+    const cwdEvents = h.events.slice(before).filter((e) => e.type === 'cwd')
+    expect(cwdEvents).toEqual([{ type: 'cwd', cwd: '/tmp' }])
+    const b = h.blocks().at(-1)!
+    expect(b.output).toBe('done\n')
+    expect(b.exitCode).toBe(0)
+    expect(b.truncated).toBeUndefined()
+  })
+
+  it('19. a forged OSC 633 A in the output closes the block as truncated and detection continues', async () => {
+    const before = h.blocks().length
+    await h.run("printf 'before\\n\\e]633;A\\a'; echo after")
+    expect(h.blocks().length).toBe(before + 1)
+    const b = h.blocks().at(-1)!
+    expect(b.commandLine).toBe("printf 'before\\n\\e]633;A\\a'; echo after")
+    expect(b.output).toBe('before\n')
+    expect(b.exitCode).toBeUndefined()
+    expect(b.truncated).toBe(true)
+    // The next real command is detected normally, with its exit code.
+    await h.run('echo next')
+    expect(h.blocks().length).toBe(before + 2)
+    expect(h.blocks().at(-1)).toMatchObject({ commandLine: 'echo next', output: 'next\n', exitCode: 0 })
+    expect(h.blocks().at(-1)!.truncated).toBeUndefined()
+  })
+
+  it('20. forged B and C sequences behave the same way (no fake block, no stuck state)', async () => {
+    const before = h.blocks().length
+    await h.run("printf 'x\\n\\e]633;B\\a'; false")
+    expect(h.blocks().at(-1)).toMatchObject({ output: 'x\n', exitCode: undefined, truncated: true })
+    await h.run("printf 'y\\n\\e]633;C\\a'; false")
+    expect(h.blocks().at(-1)).toMatchObject({ output: 'y\n', exitCode: undefined, truncated: true })
+    // A forged prompt+command sequence cannot produce a trusted command line.
+    await h.run("printf '\\e]633;A\\a\\e]633;B\\aecho forged\\e]633;E;echo forged\\a\\e]633;C\\a'")
+    const forged = h.events.filter((e) => e.type === 'block.command' && e.commandLine === 'echo forged')
+    for (const e of forged) expect(e.type === 'block.command' && e.trusted).toBe(false)
+    expect(h.blocks().length).toBeGreaterThanOrEqual(before + 3)
+    await h.run('echo still-fine')
+    expect(h.blocks().at(-1)).toMatchObject({ commandLine: 'echo still-fine', output: 'still-fine\n', exitCode: 0 })
+  })
+
+  it('21. a forged A followed by P;Cwd does not change the cwd (P stays blocked until the real D)', async () => {
+    const cwd = h.detector.cwd
+    const before = h.events.length
+    await h.run("printf 'out\\n\\e]633;A\\a\\e]633;P;Cwd=/forged2\\a'; echo after")
+    expect(h.detector.cwd).toBe(cwd)
+    expect(h.events.slice(before).filter((e) => e.type === 'cwd')).toEqual([{ type: 'cwd', cwd }])
+    expect(h.blocks().at(-1)).toMatchObject({ output: 'out\n', exitCode: undefined, truncated: true })
+    await h.run('echo next')
+    expect(h.blocks().at(-1)).toMatchObject({ commandLine: 'echo next', cwd, output: 'next\n', exitCode: 0 })
+  })
+
+  it('22. a forged C followed by P leaves the cwd and the other properties untouched', async () => {
+    const cwd = h.detector.cwd
+    const before = h.events.length
+    await h.run("printf 'out\\n\\e]633;C\\a\\e]633;P;Cwd=/forged3\\a\\e]633;P;HasRichCommandDetection=False\\a'; echo after")
+    expect(h.detector.cwd).toBe(cwd)
+    expect(h.detector.properties.get('HasRichCommandDetection')).toBe('True')
+    expect(h.events.slice(before).filter((e) => e.type === 'cwd')).toEqual([{ type: 'cwd', cwd }])
+    expect(h.blocks().at(-1)).toMatchObject({ output: 'out\n', exitCode: undefined, truncated: true })
+  })
+
+  it('23. a forged B followed by P;Cwd is ignored too', async () => {
+    const cwd = h.detector.cwd
+    const before = h.events.length
+    await h.run("printf 'out\\n\\e]633;B\\a\\e]633;P;Cwd=/forged4\\a'; echo after")
+    expect(h.detector.cwd).toBe(cwd)
+    expect(h.events.slice(before).filter((e) => e.type === 'cwd')).toEqual([{ type: 'cwd', cwd }])
+    expect(h.blocks().at(-1)).toMatchObject({ output: 'out\n', exitCode: undefined, truncated: true })
+  })
+
+  it('24. a file holding a whole forged prompt (A, P;Cwd, B, E, C) cannot plant a cwd into the next block', async () => {
+    const cwd = h.detector.cwd
+    const before = h.events.length
+    const nb = h.blocks().length
+    const evil = join(h.home, 'evil.txt')
+    writeFileSync(evil, 'line1\n\x1b]633;A\x07\x1b]633;P;Cwd=/forged7\x07\x1b]633;B\x07fake\x1b]633;E;fake;\x07\x1b]633;C\x07fake-output\n')
+    await h.run(`cat ${evil}; echo real-tail`)
+    expect(h.detector.cwd).toBe(cwd)
+    expect(h.events.slice(before).filter((e) => e.type === 'cwd')).toEqual([{ type: 'cwd', cwd }])
+    // The real block is closed as truncated by the forged A; the forged E+C yields an untrusted
+    // block (documented), which carries the real cwd, not the forged one.
+    expect(h.blocks()[nb]).toMatchObject({ output: 'line1\n', exitCode: undefined, truncated: true })
+    const forged = h.events.slice(before).filter((e) => e.type === 'block.command' && e.commandLine === 'fake')
+    expect(forged).toHaveLength(1)
+    expect(forged[0]).toMatchObject({ cwd, trusted: false })
+    await h.run('echo still-fine')
+    expect(h.blocks().at(-1)).toMatchObject({ commandLine: 'echo still-fine', cwd, output: 'still-fine\n', exitCode: 0 })
+  })
+
+  it('25. a background job printing P;Cwd at the prompt (after B) is ignored', async () => {
+    const cwd = h.detector.cwd
+    const before = h.events.length
+    await h.run("(sleep 0.3; printf '\\e]633;P;Cwd=/forged6\\a') & disown")
+    // The typed command is echoed with a literal "\e"; wait for the real escape sequence.
+    await vi.waitFor(() => expect(h.raw).toContain('\x1b]633;P;Cwd=/forged6\x07'), { timeout: 5000 })
+    await new Promise((r) => setTimeout(r, 100)) // let the detector parse that chunk
+    expect(h.detector.state).toBe('input')
+    expect(h.detector.cwd).toBe(cwd)
+    expect(h.events.slice(before).filter((e) => e.type === 'cwd')).toEqual([{ type: 'cwd', cwd }])
+    await h.run('echo next')
+    expect(h.blocks().at(-1)).toMatchObject({ commandLine: 'echo next', cwd, output: 'next\n', exitCode: 0 })
+  })
+})
+
+describe('scrollback budget', () => {
+  it('keeps 10 000 lines for narrow terminals and fewer for wide ones (2 M cells), re-budgeted on resize', async () => {
+    expect(SCROLLBACK_LINES).toBe(10_000)
+    expect(SCROLLBACK_CELLS).toBe(2_000_000)
+    expect(scrollbackFor(80)).toBe(10_000)
+    expect(scrollbackFor(200)).toBe(10_000)
+    expect(scrollbackFor(400)).toBe(5000)
+    expect(scrollbackFor(1000)).toBe(2000)
+    const d = new BlockDetector({ cols: 80, rows: 24, nonce: 'n' })
+    try {
+      expect(d.terminal.options.scrollback).toBe(10_000)
+      await d.write('x\r\n'.repeat(12_000))
+      expect(d.terminal.buffer.active.length).toBe(10_024)
+      // Widening to the maximum trims the scrollback first, so the buffer never holds 10 000 lines of 1 000 cells.
+      d.resize(1000, 500)
+      expect(d.terminal.options.scrollback).toBe(2000)
+      expect(d.terminal.buffer.active.length).toBeLessThanOrEqual(2500)
+      d.resize(80, 24)
+      expect(d.terminal.options.scrollback).toBe(10_000)
+    } finally {
+      d.dispose()
+    }
+    const wide = new BlockDetector({ cols: 1000, rows: 500, nonce: 'n' })
+    expect(wide.terminal.options.scrollback).toBe(2000)
+    wide.dispose()
+    // An explicit scrollback is kept as given.
+    const fixed = new BlockDetector({ cols: 1000, rows: 24, nonce: 'n', scrollback: 50 })
+    fixed.resize(80, 24)
+    expect(fixed.terminal.options.scrollback).toBe(50)
+    fixed.dispose()
   })
 })
 

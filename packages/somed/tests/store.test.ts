@@ -1,9 +1,9 @@
-import { mkdtempSync, readFileSync } from 'node:fs'
+import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
 import { SessionManager } from '../src/session.ts'
-import { SessionLog, SessionStore, foldBlocks, type StoredEvent } from '../src/store.ts'
+import { MAX_REPLAY_BYTES, SessionLog, SessionStore, foldBlocks, readLogPage, type StoredEvent } from '../src/store.ts'
 import { fakeHome } from './helpers.ts'
 
 function tempDir(): string {
@@ -85,4 +85,96 @@ describe('session persistence and replay with a real shell', () => {
     expect(manager.listPersisted()).toContain(session.id)
     expect(manager.list().find((s) => s.id === session.id)?.alive).toBe(false)
   }, 20_000)
+})
+
+describe('replay paging', () => {
+  it('reaches a page near the end of a large log by bisection, with seq gaps and a torn tail', () => {
+    const store = new SessionStore(tempDir())
+    const path = store.pathFor('big')
+    // ~24 MiB, 300 000 lines in SessionLog's own layout (event fields, then seq, then ts). Every 7th
+    // seq is missing (block.output dropped past the log cap), the text contains a decoy "seq":N
+    // (escaped inside the JSON string) and the last line is torn (crash mid-write).
+    const lines: string[] = []
+    const expectedSeqs: number[] = []
+    let seq = 1
+    lines.push(JSON.stringify({ type: 'session.meta', id: 'big', shell: '/bin/bash', cwd: '/', cols: 80, rows: 24, createdAt: 1, pid: 1, seq, ts: 1 }))
+    expectedSeqs.push(seq)
+    while (lines.length < 300_000) {
+      seq++
+      if (seq % 7 === 0) continue
+      lines.push(JSON.stringify({ type: 'block.output', id: 'big:1', text: `${'x'.repeat(50)} "seq":${seq * 10}\n`, seq, ts: seq }))
+      expectedSeqs.push(seq)
+    }
+    const lastSeq = seq
+    writeFileSync(path, lines.join('\n') + '\n' + '{"type":"block.output","id":"big:1","text":"torn","seq":99')
+    // Paging from the start yields every event exactly once, in order, and `more` comes from the same scan.
+    const got: number[] = []
+    let fromSeq = 0
+    let pages = 0
+    for (;;) {
+      const page = store.readPage('big', fromSeq, 1000)
+      got.push(...page.events.map((e) => e.seq))
+      pages++
+      if (!page.more) break
+      expect(page.events).toHaveLength(1000)
+      fromSeq = page.events[page.events.length - 1]!.seq
+    }
+    expect(pages).toBe(300)
+    expect(got.length).toBe(expectedSeqs.length)
+    expect(got.join(',')).toBe(expectedSeqs.join(','))
+    // Random access: the first event of a page is the first seq above fromSeq, gaps included.
+    for (const from of [0, 1, 6, 7, 8, 1234, 150_000, lastSeq - 8, lastSeq - 1, lastSeq, lastSeq + 5]) {
+      const page = store.readPage('big', from, 3)
+      const wanted = expectedSeqs.filter((s) => s > from)
+      expect(page.events.map((e) => e.seq), `fromSeq ${from}`).toEqual(wanted.slice(0, 3))
+      expect(page.more, `fromSeq ${from}`).toBe(wanted.length > 3)
+    }
+    expect(store.hasMore('big', lastSeq)).toBe(false)
+    expect(store.hasMore('big', lastSeq - 1)).toBe(true)
+    expect(readLogPage(join(store.dir, 'missing.jsonl'), 0)).toEqual({ events: [], more: false })
+    // A page near the end costs a few 64 KiB probes plus the page itself, not a scan of the whole
+    // file (which takes hundreds of milliseconds here and made paging a log O(N²)).
+    const t0 = performance.now()
+    for (let i = 0; i < 20; i++) store.readPage('big', lastSeq - 1500 - i * 1000, 1000)
+    expect((performance.now() - t0) / 20).toBeLessThan(100)
+  }, 30_000)
+
+  it('ends a page early once it holds about 1 MiB of lines, keeps delivering oversized events one per page', () => {
+    const store = new SessionStore(tempDir())
+    const log = store.open('fat', 1 << 30)
+    log.append({ type: 'session.meta', id: 'fat', shell: '/bin/bash', cwd: '/', cols: 80, rows: 24, createdAt: 1, pid: 1 })
+    for (let i = 0; i < 10; i++) log.append({ type: 'block.output', id: 'fat:1', text: 'y'.repeat(300 * 1024) })
+    log.append({ type: 'block.output', id: 'fat:1', text: 'z'.repeat(2 * MAX_REPLAY_BYTES) })
+    log.append({ type: 'session.exit', exitCode: 0, blockCount: 1 })
+    log.close()
+    const seqs: number[][] = []
+    let fromSeq = 0
+    for (;;) {
+      const page = store.readPage('fat', fromSeq, 1000)
+      seqs.push(page.events.map((e) => e.seq))
+      if (!page.more) break
+      fromSeq = page.events[page.events.length - 1]!.seq
+    }
+    // meta + 3 × 300 KiB fit under 1 MiB; the 4th output would not. The 2 MiB event travels alone.
+    expect(seqs).toEqual([[1, 2, 3, 4], [5, 6, 7], [8, 9, 10], [11], [12], [13]])
+    expect(seqs.flat()).toHaveLength(13)
+  })
+
+  it('decodes multi-byte characters that straddle a 64 KiB read boundary', () => {
+    // Three ids of different lengths shift the text by one byte each, so one of the three logs has
+    // a 3-byte character cut by the 65 536-byte chunk boundary.
+    const text = 'ก'.repeat(40_000)
+    for (const id of ['u1', 'u22', 'u333']) {
+      const store = new SessionStore(tempDir())
+      const log = store.open(id)
+      log.append({ type: 'session.meta', id, shell: '/bin/bash', cwd: '/', cols: 80, rows: 24, createdAt: 1, pid: 1 })
+      log.append({ type: 'block.output', id: `${id}:1`, text })
+      log.append({ type: 'block.output', id: `${id}:1`, text: 'after' })
+      log.close()
+      const events = store.read(id)
+      expect(events.map((e) => e.seq)).toEqual([1, 2, 3])
+      expect((events[1] as { text: string }).text).toBe(text)
+      expect((events[2] as { text: string }).text).toBe('after')
+    }
+  })
 })

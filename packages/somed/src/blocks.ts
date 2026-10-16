@@ -16,6 +16,17 @@
  * Output text is read back from the terminal buffer between markers, so cursor movement, `\r`
  * progress bars and colours are resolved exactly as a user would see them. Commands that switch
  * to the alternate screen (less, vi, htop…) are flagged `tui` and their output is not captured.
+ *
+ * Forged sequences: anything a command prints reaches this parser too (`cat` of a file holding
+ * `ESC ] 633 ; A BEL`). Only `E` carries the per-session nonce, so the others cannot be
+ * authenticated. The policy: a stray `A`, `B` or `C` while a block is running closes it with
+ * `exitCode: undefined, truncated: true` and parsing continues normally, so the next real command
+ * is still detected. `P` (Cwd and other properties) is accepted only where the shells emit it:
+ * at startup, between `D` and `B` (bash/zsh/fish report `P;Cwd` after `D`, pwsh between `A` and
+ * `B`). It is ignored while a command runs, while the prompt is waiting for input (`B` seen: a
+ * background job printing to the terminal) and, after a stray `A`/`B`/`C` closed a block, until
+ * the shell's own `D` arrives. A forged `D` ends the block with the forged exit code
+ * (indistinguishable, documented gap).
  */
 import xterm from '@xterm/headless'
 import type { IMarker, Terminal } from '@xterm/headless'
@@ -25,7 +36,16 @@ export type BlockEvent =
   | { type: 'block.start'; id: string; ts: number }
   | { type: 'block.command'; id: string; commandLine: string; cwd: string; trusted: boolean; prompt?: string }
   | { type: 'block.output'; id: string; text: string }
-  | { type: 'block.end'; id: string; exitCode: number | undefined; durationMs: number; tui: boolean; ts: number }
+  | {
+      type: 'block.end'
+      id: string
+      exitCode: number | undefined
+      durationMs: number
+      tui: boolean
+      ts: number
+      /** The block was closed by a stray A/B/C arriving while it was still running (see below), not by `D`. */
+      truncated?: boolean
+    }
   /** Working directory reported by the shell (`OSC 633 ; P ; Cwd=…`), after every command and at startup. */
   | { type: 'cwd'; cwd: string }
 
@@ -76,6 +96,20 @@ export function parseKeyValueAssignment(message: string): { key: string; value: 
   return { key: message.substring(0, i), value: message.substring(i + 1) }
 }
 
+/** Most scrollback lines the headless terminal keeps (narrow terminals). */
+export const SCROLLBACK_LINES = 10_000
+/**
+ * Scrollback budget in cells: xterm allocates `cols` cells (12 bytes each) for every line as soon
+ * as it exists, so 10 000 lines at 1 000 columns would be ~120 MiB per session. 2 M cells is
+ * 10 000 lines up to 200 columns and 2 000 lines at 1 000 columns (~24 MiB).
+ */
+export const SCROLLBACK_CELLS = 2_000_000
+
+/** Scrollback lines for a terminal `cols` wide: SCROLLBACK_LINES, reduced so that cols × lines ≤ SCROLLBACK_CELLS. */
+export function scrollbackFor(cols: number): number {
+  return Math.max(100, Math.min(SCROLLBACK_LINES, Math.floor(SCROLLBACK_CELLS / Math.max(1, cols))))
+}
+
 export class BlockDetector {
   readonly terminal: Terminal
   readonly #nonce: string
@@ -96,16 +130,24 @@ export class BlockDetector {
   #writes = 0
   #properties = new Map<string, string>()
   #seenOsc633 = false
+  /**
+   * `P` is refused after a stray `A`/`B`/`C` closed a block (the sequence came from command output,
+   * so what follows it in the same output is not the shell either) until the shell's own `D`.
+   */
+  #propsBlocked = false
+  /** Fixed scrollback requested by the caller; otherwise it follows the width (see scrollbackFor). */
+  readonly #scrollbackOverride: number | undefined
 
   constructor(options: BlockDetectorOptions) {
     this.#nonce = options.nonce
     this.#idPrefix = options.idPrefix ?? ''
     this.#blockCounter = options.firstBlockNumber ?? 0
+    this.#scrollbackOverride = options.scrollback
     this.terminal = new xterm.Terminal({
       cols: options.cols,
       rows: options.rows,
       allowProposedApi: true,
-      scrollback: options.scrollback ?? 10_000,
+      scrollback: options.scrollback ?? scrollbackFor(options.cols),
     })
     this.terminal.parser.registerOscHandler(633, (data) => this.#handleOsc633(data))
     this.terminal.buffer.onBufferChange((buffer) => {
@@ -153,7 +195,14 @@ export class BlockDetector {
   }
 
   resize(cols: number, rows: number): void {
-    if (!this.#disposed) this.terminal.resize(cols, rows)
+    if (this.#disposed) return
+    // Re-budget the scrollback before widening: xterm resizes every existing line to the new
+    // width, so trimming first keeps a 10 000-line buffer from briefly becoming 1 000 cells wide.
+    if (this.#scrollbackOverride === undefined) {
+      const scrollback = scrollbackFor(cols)
+      if (this.terminal.options.scrollback !== scrollback) this.terminal.options.scrollback = scrollback
+    }
+    this.terminal.resize(cols, rows)
   }
 
   /** Dispose the detector; a block still running is ended with `exitCode` (e.g. the shell's exit code). */
@@ -189,6 +238,11 @@ export class BlockDetector {
         return true
       }
       case 'P': {
+        // The shells only report properties at startup and between D and B (bash/zsh/fish right
+        // after D, pwsh between A and B). While a command runs, while the prompt waits for input
+        // (a background job can print to the terminal then) or after a stray A/B/C closed a block
+        // (until the real D) the sequence can only come from program output: ignore it.
+        if (this.#state === 'executing' || this.#state === 'input' || this.#propsBlocked) return true
         const { key, value } = parseKeyValueAssignment(args[0] !== undefined ? deserializeOscMessage(args[0]) : '')
         if (value === undefined) return true
         this.#properties.set(key, value)
@@ -215,8 +269,10 @@ export class BlockDetector {
   }
 
   #handlePromptStart(): boolean {
-    // A prompt while a command is still "executing" means we missed D (e.g. shell was reset).
-    if (this.#current) this.#finish(undefined)
+    // A prompt while a command is still running: either we missed D (shell reset, nested shell
+    // with its own integration) or the command's output contained the sequence. Close the block
+    // as truncated and carry on as a normal prompt start.
+    if (this.#current) this.#finish(undefined, true)
     this.#state = 'prompt'
     this.#promptMarker?.dispose()
     this.#promptMarker = this.terminal.registerMarker(0)
@@ -225,6 +281,9 @@ export class BlockDetector {
   }
 
   #handleCommandStart(): boolean {
+    if (this.#current) this.#finish(undefined, true)
+    // From here until D the only legitimate writer is the user's typing (echoed by the tty).
+    this.#propsBlocked = true
     this.#state = 'input'
     this.#inputMarker?.dispose()
     this.#inputMarker = this.terminal.registerMarker(0)
@@ -235,7 +294,12 @@ export class BlockDetector {
   }
 
   #handleCommandExecuted(): boolean {
-    if (this.#current) return true // duplicate C — keep the running block
+    if (this.#current) {
+      // A second C while a block runs can only be forged (or a nested shell): close the block as
+      // truncated and do not start another one from the stale prompt/input markers.
+      this.#finish(undefined, true)
+      return true
+    }
     const buf = this.terminal.buffer.active
     const pending = this.#pendingCommandLine
     this.#pendingCommandLine = undefined
@@ -314,6 +378,8 @@ export class BlockDetector {
 
   #handleCommandFinished(exitCodeArg: string | undefined): boolean {
     this.#pendingCommandLine = undefined
+    // The shell is back in control: properties (P;Cwd follows right away) are trusted again.
+    this.#propsBlocked = false
     if (!this.#current) {
       // D without C: an empty command line (just Enter) — nothing to report.
       this.#state = 'idle'
@@ -324,12 +390,13 @@ export class BlockDetector {
     return true
   }
 
-  #finish(exitCode: number | undefined): void {
+  #finish(exitCode: number | undefined, truncated = false): void {
     const block = this.#current
     if (!block) return
     this.#flushOutput(true)
     this.#current = undefined
     this.#state = 'idle'
+    if (truncated) this.#propsBlocked = true
     block.outputMarker?.dispose()
     block.streamMarker?.dispose()
     this.#events.fire({
@@ -339,6 +406,7 @@ export class BlockDetector {
       durationMs: Math.round(performance.now() - block.startedAt),
       tui: block.tui,
       ts: Date.now(),
+      ...(truncated ? { truncated: true } : {}),
     })
   }
 

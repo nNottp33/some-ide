@@ -7,11 +7,14 @@
  *
  * Limits: a log stops recording `block.output` once it reaches `maxBytes` (64 MiB by default);
  * the small structural events (block.start/command/end, cwd, session.exit) are still appended so
- * the block list stays complete. Reads are chunked: `read(id, fromSeq, limit)` stops as soon as
- * `limit` events were collected instead of parsing the whole file.
+ * the block list stays complete. Reads are paged: `readPage(id, fromSeq, limit)` bisects the file
+ * for the first line with `seq > fromSeq` (seqs grow with the offset), then scans forward and
+ * stops after `limit` events or MAX_REPLAY_BYTES of lines, so paging through a log costs O(N)
+ * in total and no page blocks the event loop for long.
  */
 import { closeSync, existsSync, fstatSync, mkdirSync, openSync, readdirSync, readSync, unlinkSync, writeSync } from 'node:fs'
 import { join } from 'node:path'
+import { StringDecoder } from 'node:string_decoder'
 import type { BlockEvent } from './blocks.ts'
 
 export interface SessionMeta {
@@ -41,8 +44,18 @@ export type StoredEvent = SessionEvent & { seq: number; ts: number }
 export const DEFAULT_MAX_LOG_BYTES = 64 * 1024 * 1024
 /** Most events a single `read` returns (one replay chunk). */
 export const MAX_REPLAY_CHUNK = 1000
+/** A page also ends once its lines add up to this many characters (bounds the size of one reply frame). */
+export const MAX_REPLAY_BYTES = 1024 * 1024
 
 const READ_CHUNK = 64 * 1024
+/** Longest line the seq bisection will assemble for one probe before giving up on that probe. */
+const MAX_PROBE_LINE = 16 * 1024 * 1024
+
+export interface LogPage {
+  events: StoredEvent[]
+  /** More events with a higher seq exist (fetch the next page from the last returned seq). */
+  more: boolean
+}
 
 export interface SessionSummary {
   meta: SessionMeta
@@ -69,15 +82,20 @@ export class SessionStore {
 
   /**
    * Read persisted events of a session with seq > fromSeq, at most `limit` of them (default and
-   * maximum MAX_REPLAY_CHUNK). The file is scanned in 64 KiB chunks and the scan stops early.
+   * maximum MAX_REPLAY_CHUNK) and at most MAX_REPLAY_BYTES of log lines. See `readLogPage`.
    */
   read(sessionId: string, fromSeq = 0, limit = MAX_REPLAY_CHUNK): StoredEvent[] {
-    return readLogEvents(this.pathFor(sessionId), fromSeq, limit)
+    return this.readPage(sessionId, fromSeq, limit).events
   }
 
-  /** Does the log hold any event with seq > fromSeq? (Cheap "is there more?" check for chunked replay.) */
+  /** One replay page: the events plus whether a later one exists (found by the same scan). */
+  readPage(sessionId: string, fromSeq = 0, limit = MAX_REPLAY_CHUNK): LogPage {
+    return readLogPage(this.pathFor(sessionId), fromSeq, limit)
+  }
+
+  /** Does the log hold any event with seq > fromSeq? (Bisection + one line.) */
   hasMore(sessionId: string, fromSeq: number): boolean {
-    return this.read(sessionId, fromSeq, 1).length > 0
+    return this.readPage(sessionId, fromSeq, 1).events.length > 0
   }
 
   /**
@@ -100,39 +118,143 @@ export class SessionStore {
   }
 }
 
-/** Events with seq > fromSeq from a JSONL log, at most `limit` (scanned in 64 KiB chunks, stops early). */
+/** Events with seq > fromSeq from a JSONL log, at most `limit` (see `readLogPage`). */
 export function readLogEvents(path: string, fromSeq = 0, limit = MAX_REPLAY_CHUNK): StoredEvent[] {
-  if (!existsSync(path)) return []
+  return readLogPage(path, fromSeq, limit).events
+}
+
+/**
+ * One page of events with seq > fromSeq: at most `limit` (≤ MAX_REPLAY_CHUNK) events and, past
+ * the first one, at most MAX_REPLAY_BYTES of lines. The scan starts at the offset `seekSeq`
+ * bisects to instead of at byte 0, parses only lines whose seq (read with a cheap string search)
+ * is wanted, and reports `more` from the line that did not fit instead of a second scan.
+ */
+export function readLogPage(path: string, fromSeq = 0, limit = MAX_REPLAY_CHUNK): LogPage {
+  if (!existsSync(path)) return { events: [], more: false }
   const max = Math.max(1, Math.min(limit, MAX_REPLAY_CHUNK))
   const out: StoredEvent[] = []
+  let chars = 0
   let fd: number | undefined
   try {
     fd = openSync(path, 'r')
+    const size = fstatSync(fd).size
     const buf = Buffer.allocUnsafe(READ_CHUNK)
+    // Decodes across chunk boundaries (a multi-byte character split at 64 KiB stays intact).
+    const decoder = new StringDecoder('utf8')
     let rest = ''
-    let position = 0
+    let position = fromSeq > 0 ? seekSeq(fd, size, fromSeq) : 0
     for (;;) {
       const n = readSync(fd, buf, 0, READ_CHUNK, position)
       if (n === 0) break
       position += n
-      rest += buf.toString('utf8', 0, n)
+      rest += decoder.write(buf.subarray(0, n))
       let nl: number
       while ((nl = rest.indexOf('\n')) !== -1) {
         const line = rest.slice(0, nl)
         rest = rest.slice(nl + 1)
         if (!line) continue
+        const seq = quickSeq(line)
+        if (seq !== undefined && seq <= fromSeq) continue
         const ev = parseLine(line)
-        if (ev && ev.seq > fromSeq) {
-          out.push(ev)
-          if (out.length >= max) return out
-        }
+        if (!ev || ev.seq <= fromSeq) continue
+        if (out.length >= max || (out.length > 0 && chars + line.length > MAX_REPLAY_BYTES)) return { events: out, more: true }
+        out.push(ev)
+        chars += line.length
       }
     }
     // A torn last line (crash mid-write, no trailing newline) is skipped.
   } finally {
     if (fd !== undefined) closeSync(fd)
   }
-  return out
+  return { events: out, more: false }
+}
+
+/**
+ * The `seq` of a log line without parsing it. `"seq":` cannot occur inside a JSON string (a quote
+ * in a string is always escaped) and keys are unique, so the last occurrence is the real field.
+ */
+function quickSeq(line: string): number | undefined {
+  const i = line.lastIndexOf('"seq":')
+  if (i === -1) return undefined
+  let n = 0
+  let digits = 0
+  for (let j = i + 6; j < line.length; j++) {
+    const c = line.charCodeAt(j)
+    if (c < 48 || c > 57) break
+    n = n * 10 + (c - 48)
+    digits++
+  }
+  return digits > 0 ? n : undefined
+}
+
+/** Same as `quickSeq` on the bytes [from, to) of a buffer. */
+function quickSeqBytes(buf: Buffer, from: number, to: number): number | undefined {
+  const i = buf.lastIndexOf('"seq":', to - 1, 'latin1')
+  if (i < from) return undefined
+  let n = 0
+  let digits = 0
+  for (let j = i + 6; j < to; j++) {
+    const c = buf[j]!
+    if (c < 48 || c > 57) break
+    n = n * 10 + (c - 48)
+    digits++
+  }
+  return digits > 0 ? n : undefined
+}
+
+/**
+ * Byte offset from which a forward scan finds every event with seq > fromSeq, by bisection:
+ * each step probes the first complete line after the midpoint. `lo` only moves past lines known
+ * to have seq ≤ fromSeq (and, seqs being monotonic, everything before them), and `hi` only moves
+ * to lines known to be wanted; a probe that cannot be read (torn, huge or unparsable line) just
+ * halves the range conservatively. The caller scans forward from the result, so the answer is
+ * always correct and merely less tight in odd files.
+ */
+function seekSeq(fd: number, size: number, fromSeq: number): number {
+  let lo = 0
+  let hi = size
+  while (hi - lo > 2 * READ_CHUNK) {
+    const mid = lo + Math.floor((hi - lo) / 2)
+    const probe = probeLine(fd, size, mid)
+    if (!probe || probe.start >= hi) {
+      hi = mid
+      continue
+    }
+    if (probe.seq <= fromSeq) lo = probe.end
+    else hi = probe.start
+  }
+  return lo
+}
+
+/** Bounds and seq of the first complete line that starts after `pos` (i.e. after the next newline). */
+function probeLine(fd: number, size: number, pos: number): { start: number; end: number; seq: number } | undefined {
+  let data = Buffer.alloc(0)
+  const grow = (): boolean => {
+    const have = data.length
+    if (pos + have >= size || have >= MAX_PROBE_LINE) return false
+    const len = Math.min(have === 0 ? READ_CHUNK : have, size - pos - have, MAX_PROBE_LINE - have)
+    const more = Buffer.allocUnsafe(len)
+    const n = readSync(fd, more, 0, len, pos + have)
+    if (n === 0) return false
+    data = Buffer.concat([data, more.subarray(0, n)])
+    return true
+  }
+  let searchFrom = 0
+  let nl: number
+  while ((nl = data.indexOf(10, searchFrom)) === -1) {
+    searchFrom = data.length
+    if (!grow()) return undefined
+  }
+  const start = nl + 1
+  searchFrom = start
+  let end: number
+  while ((end = data.indexOf(10, searchFrom)) === -1) {
+    searchFrom = data.length
+    if (!grow()) return undefined
+  }
+  const seq = quickSeqBytes(data, start, end)
+  if (seq === undefined) return undefined
+  return { start: pos + start, end: pos + end + 1, seq }
 }
 
 /** First line of a log (the `session.meta` record of a session log). */
@@ -246,10 +368,9 @@ export class SessionLog {
     const stored = { ...event, seq: ++this.#seq, ts: 'ts' in event && typeof event.ts === 'number' ? event.ts : Date.now() } as StoredEvent
     if (this.#fd === undefined) return stored
     const line = JSON.stringify(stored) + '\n'
-    if (this.#bytes + line.length > this.maxBytes) {
-      if (!this.#truncated) this.#truncated = true
-      if (event.type === 'block.output') return stored
-    }
+    if (!this.#truncated && this.#bytes + line.length > this.maxBytes) this.#truncated = true
+    // Sticky: once the cap was hit no further output is recorded, however small the chunk.
+    if (this.#truncated && event.type === 'block.output') return stored
     this.#bytes += line.length
     writeSync(this.#fd, line)
     return stored

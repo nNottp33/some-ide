@@ -1,10 +1,10 @@
-import { generateKeyPairSync } from 'node:crypto'
-import { mkdtempSync, readFileSync, writeFileSync, existsSync, mkdirSync } from 'node:fs'
+import { generateKeyPairSync, sign as cryptoSign } from 'node:crypto'
+import { mkdtempSync, readFileSync, writeFileSync, existsSync, mkdirSync, realpathSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
-import { Authenticator, DeviceRegistry, Pairing, generatePairingCode, readPairingFile, writePairingFile } from '../src/auth.ts'
-import { loadOrCreateDevice, RpcClientError, signNonce, SomedClient, type DeviceIdentity } from '../src/client.ts'
+import { Authenticator, DeviceRegistry, Pairing, authPayload, generatePairingCode, readPairingFile, writePairingFile } from '../src/auth.ts'
+import { loadOrCreateDevice, RpcClientError, signChallenge, SomedClient, type DeviceIdentity } from '../src/client.ts'
 import { ensureTls, startDaemon, type Daemon } from '../src/server.ts'
 import { fakeHome } from './helpers.ts'
 
@@ -41,6 +41,7 @@ describe('pairing and Ed25519 authentication (unit)', () => {
     const device = loadOrCreateDevice(join(dir, 'client'))
     for (let i = 0; i < 5; i++) pairing.complete('111111', device.publicKey, 'x')
     expect(pairing.complete(code.code, device.publicKey, 'x')).toMatchObject({ ok: false })
+    expect(readPairingFile(dir)).toBeUndefined()
   })
 
   it('accepts a code written by the `somed pair` CLI (pairing.json)', () => {
@@ -53,26 +54,37 @@ describe('pairing and Ed25519 authentication (unit)', () => {
     expect(pairing.complete(code, device.publicKey, 'phone').ok).toBe(true)
   })
 
-  it('challenge/response with Node crypto', () => {
+  it('challenge/response with Node crypto, bound to the server certificate hash', () => {
     const dir = tempDir()
     const registry = new DeviceRegistry(dir)
     const device = loadOrCreateDevice(join(dir, 'client'))
     registry.add({ publicKey: device.publicKey, name: 'd', pairedAt: Date.now() })
-    const auth = new Authenticator(registry)
+    const certHash = Buffer.alloc(32, 7)
+    const auth = new Authenticator(registry, certHash)
     expect(auth.verify('abc')).toMatchObject({ ok: false, error: 'no challenge outstanding' })
     const unknown = generateKeyPairSync('ed25519').publicKey.export({ type: 'spki', format: 'der' }).toString('base64')
     expect(auth.challenge(unknown)).toMatchObject({ ok: false })
     const ch = auth.challenge(device.publicKey)
     expect(ch.ok).toBe(true)
     if (!ch.ok) return
-    // Wrong key signing the nonce fails.
+    // Wrong key signing the payload fails.
     const other = generateKeyPairSync('ed25519').privateKey
-    expect(auth.verify(signNonce(ch.nonce, other))).toMatchObject({ ok: false })
+    expect(auth.verify(signChallenge(ch.nonce, certHash, other))).toMatchObject({ ok: false })
     expect(auth.authenticated).toBe(false)
+    // Right key, wrong channel binding (what a relay with its own certificate would obtain) fails.
     const ch2 = auth.challenge(device.publicKey)
     if (!ch2.ok) return
-    expect(auth.verify(signNonce(ch2.nonce, device.privateKey))).toMatchObject({ ok: true })
+    expect(auth.verify(signChallenge(ch2.nonce, Buffer.alloc(32, 9), device.privateKey))).toMatchObject({ ok: false })
+    // Right key, legacy payload (raw nonce only) fails.
+    const ch3 = auth.challenge(device.publicKey)
+    if (!ch3.ok) return
+    const legacy = cryptoSign(null, Buffer.from(ch3.nonce, 'base64'), device.privateKey).toString('base64')
+    expect(auth.verify(legacy)).toMatchObject({ ok: false })
+    const ch4 = auth.challenge(device.publicKey)
+    if (!ch4.ok) return
+    expect(auth.verify(signChallenge(ch4.nonce, certHash, device.privateKey))).toMatchObject({ ok: true })
     expect(auth.authenticated).toBe(true)
+    expect(authPayload(certHash, Buffer.alloc(32)).subarray(0, 13).toString()).toBe('somed-auth-v1')
     // The device identity file is reloaded with the same key.
     expect(loadOrCreateDevice(join(dir, 'client')).publicKey).toBe(device.publicKey)
   })
@@ -85,6 +97,7 @@ describe('TLS material', () => {
     expect(tls).toBeDefined()
     expect(tls!.cert.toString()).toContain('BEGIN CERTIFICATE')
     expect(tls!.fingerprint).toMatch(/^([0-9A-F]{2}:){31}[0-9A-F]{2}$/)
+    expect(tls!.certHash.toString('hex').toUpperCase()).toBe(tls!.fingerprint.replaceAll(':', ''))
     // Second call re-uses the files.
     expect(ensureTls(dir)!.fingerprint).toBe(tls!.fingerprint)
   })
@@ -101,7 +114,7 @@ describe('daemon over WebSocket', () => {
     dir = tempDir()
     home = fakeHome()
     device = loadOrCreateDevice(join(dir, 'client'), 'test-device')
-    daemon = await startDaemon({ port: 0, dataDir: dir, tls: true, log: (m) => logs.push(m) })
+    daemon = await startDaemon({ port: 0, dataDir: dir, root: realpathSync(tmpdir()), tls: true, log: (m) => logs.push(m) })
   }, 20_000)
 
   afterAll(async () => {
@@ -118,6 +131,7 @@ describe('daemon over WebSocket', () => {
     expect(daemon.url.startsWith('wss://')).toBe(true)
     const c = await SomedClient.connect(daemon.url, { insecure: true })
     expect(await c.call('ping')).toMatchObject({ tls: true })
+    expect(c.peerFingerprint).toBe(daemon.tls!.fingerprint)
     await expect(c.call('session.list')).rejects.toMatchObject({ code: -32001 })
     await expect(c.call('nope')).rejects.toMatchObject({ code: -32001 })
     c.close()
@@ -127,29 +141,48 @@ describe('daemon over WebSocket', () => {
     await expect(SomedClient.connect(daemon.url, { fingerprint: 'AA:BB' })).rejects.toThrow(/fingerprint/)
   })
 
-  it('pairs with the code printed on the console, then authenticates', async () => {
+  it('pairs with the code printed on the console (never minted over the network), then authenticates', async () => {
     const c = await SomedClient.connect(daemon.url, { insecure: true })
-    const started = await c.call<{ expiresAt: number }>('pair.start')
-    expect(started.expiresAt).toBeGreaterThan(Date.now())
+    // pair.start only reports; it does not create a code.
+    expect(await c.call('pair.start')).toMatchObject({ pending: false, lockedForMs: 0 })
+    expect(logs.join('\n')).not.toMatch(/Pairing code/)
+    const started = daemon.pairing.start() // what `somed pair` / `somed serve --pair` do on the host
+    expect(await c.call('pair.start')).toMatchObject({ pending: true, expiresAt: started.expiresAt })
     const code = /Pairing code: (\d{6})/.exec(logs.join('\n'))?.[1]
-    expect(code).toBeDefined()
+    expect(code).toBe(started.code)
+    // A wrong code is refused, logged with the remote address, and the socket is closed.
+    const closed = new Promise<number>((res) => c.ws.once('close', (closeCode) => res(closeCode)))
     await expect(c.pair(device, '000000')).rejects.toMatchObject({ code: -32003 })
-    await c.pair(device, code!)
+    expect(await closed).toBe(1008)
+    expect(logs.join('\n')).toMatch(/pairing failed from 127\.0\.0\.1:\d+: wrong pairing code/)
+    const c2 = await SomedClient.connect(daemon.url, { insecure: true })
+    await c2.pair(device, code!)
     expect(daemon.registry.get(device.publicKey)?.name).toBe('test-device')
     // Not yet authenticated: pairing alone does not grant access.
-    await expect(c.call('session.list')).rejects.toMatchObject({ code: -32001 })
-    await c.authenticate(device)
-    const info = await c.call<{ shells: string[]; tls: boolean }>('server.info')
+    await expect(c2.call('session.list')).rejects.toMatchObject({ code: -32001 })
+    await c2.authenticate(device)
+    const info = await c2.call<{ shells: string[]; tls: boolean; root: string; limits: { maxSessions: number } }>('server.info')
     expect(info.tls).toBe(true)
     expect(info.shells).toContain('bash')
-    c.close()
+    expect(info.root).toBe(daemon.root)
+    expect(info.limits.maxSessions).toBe(64)
+    c2.close()
   })
 
-  it('rejects a forged signature', async () => {
+  it('rejects forged, relayed and legacy signatures', async () => {
     const c = await SomedClient.connect(daemon.url, { insecure: true })
-    const { nonce } = await c.call<{ nonce: string }>('auth.challenge', { devicePublicKey: device.publicKey })
     const other = generateKeyPairSync('ed25519').privateKey
-    await expect(c.call('auth.verify', { signature: signNonce(nonce, other) })).rejects.toMatchObject({ code: -32001 })
+    let { nonce } = await c.call<{ nonce: string }>('auth.challenge', { devicePublicKey: device.publicKey })
+    await expect(c.call('auth.verify', { signature: signChallenge(nonce, c.peerCertHash, other) })).rejects.toMatchObject({ code: -32001 })
+    // Relay: the device signed what it saw on a connection to an attacker with another certificate.
+    ;({ nonce } = await c.call<{ nonce: string }>('auth.challenge', { devicePublicKey: device.publicKey }))
+    await expect(c.call('auth.verify', { signature: signChallenge(nonce, Buffer.alloc(32, 1), device.privateKey) })).rejects.toMatchObject({ code: -32001 })
+    // Legacy payload (signature over the raw nonce).
+    ;({ nonce } = await c.call<{ nonce: string }>('auth.challenge', { devicePublicKey: device.publicKey }))
+    const legacy = cryptoSign(null, Buffer.from(nonce, 'base64'), device.privateKey).toString('base64')
+    await expect(c.call('auth.verify', { signature: legacy })).rejects.toMatchObject({ code: -32001 })
+    await expect(c.call('session.list')).rejects.toMatchObject({ code: -32001 })
+    expect(logs.join('\n')).toMatch(/authentication failed from 127\.0\.0\.1:\d+/)
     c.close()
   })
 
@@ -178,8 +211,9 @@ describe('daemon over WebSocket', () => {
 
     // Reattach from another client, replaying only what we missed.
     const c2 = await connectAuthenticated()
-    const attached = await c2.call<{ alive: boolean; events: { seq: number; type: string }[]; scrollback: string }>('session.attach', { id: session.id, fromSeq: 0 })
+    const attached = await c2.call<{ alive: boolean; events: { seq: number; type: string }[]; scrollback: string; more: boolean }>('session.attach', { id: session.id, fromSeq: 0 })
     expect(attached.alive).toBe(true)
+    expect(attached.more).toBe(false)
     expect(attached.events[0]).toMatchObject({ seq: 1, type: 'session.meta' })
     expect(attached.events.map((e) => e.type)).toEqual(expect.arrayContaining(['block.start', 'block.command', 'block.output', 'block.end']))
     expect(attached.scrollback).toContain('via-ws')
@@ -192,13 +226,20 @@ describe('daemon over WebSocket', () => {
     expect((await end2).params).toMatchObject({ exitCode: 1 })
     await c2.call('session.resize', { id: session.id, cols: 120, rows: 40 })
 
-    // Kill and verify the exit is persisted.
+    // Kill and verify the exit is persisted; the dead session is evicted from memory but still listed.
     const exit = c2.waitFor((m) => m === 'session.exit')
     await c2.call('session.kill', { id: session.id })
     await exit
     const persisted = daemon.sessions.replay(session.id)
     expect(persisted.at(-1)?.type).toBe('session.exit')
     expect(existsSync(join(dir, 'sessions', `${session.id}.jsonl`))).toBe(true)
+    expect(daemon.sessions.get(session.id)).toBeUndefined()
+    const after = await c2.call<{ sessions: { id: string; alive: boolean; blockCount: number }[] }>('session.list')
+    expect(after.sessions.find((s) => s.id === session.id)).toMatchObject({ alive: false, blockCount: 2 })
+    const dead = await c2.attach(session.id, 0)
+    expect(dead.alive).toBe(false)
+    expect(dead.events.at(-1)?.type).toBe('session.exit')
+    await expect(c2.call('session.input', { id: session.id, data: 'x' })).rejects.toMatchObject({ code: -32002 })
     await expect(c2.call('session.input', { id: 'nope', data: 'x' })).rejects.toMatchObject({ code: -32002 })
     c2.close()
   }, 20_000)
@@ -217,7 +258,7 @@ describe('daemon over WebSocket', () => {
     const b64 = await c.call<{ content: string }>('fs.read', { path: join(root, 'a.txt'), encoding: 'base64' })
     expect(Buffer.from(b64.content, 'base64').toString()).toBe('hello')
     const { watchId } = await c.call<{ watchId: string }>('fs.watch', { path: root })
-    const event = c.waitFor((m, p) => m === 'fs.event' && p.watchId === watchId)
+    const event = c.waitFor((m, p) => m === 'fs.event' && p.watchId === watchId && p.filename === 'b.txt')
     await c.call('fs.write', { path: join(root, 'b.txt'), content: 'new file' })
     expect((await event).params).toMatchObject({ watchId, filename: 'b.txt' })
     expect(readFileSync(join(root, 'b.txt'), 'utf8')).toBe('new file')
@@ -228,15 +269,21 @@ describe('daemon over WebSocket', () => {
 })
 
 describe('daemon without TLS', () => {
-  it('falls back to ws:// with a warning when tls is disabled', async () => {
+  it('falls back to ws:// with a warning when tls is disabled, auth uses the empty channel binding', async () => {
     const dir = tempDir()
     const logs: string[] = []
-    const daemon = await startDaemon({ port: 0, dataDir: dir, tls: false, log: (m) => logs.push(m) })
+    const daemon = await startDaemon({ port: 0, dataDir: dir, root: dir, tls: false, log: (m) => logs.push(m) })
     try {
       expect(daemon.url.startsWith('ws://')).toBe(true)
       expect(logs.join('\n')).toMatch(/WARNING.*without TLS/)
       const c = await SomedClient.connect(daemon.url)
       expect(await c.call('ping')).toMatchObject({ tls: false })
+      expect(c.peerCertHash).toBeUndefined()
+      const device = loadOrCreateDevice(join(dir, 'client'), 'plain')
+      const code = daemon.pairing.start()
+      await c.pair(device, code.code)
+      await c.authenticate(device)
+      expect(await c.call('server.info')).toMatchObject({ tls: false })
       c.close()
     } finally {
       await daemon.close()

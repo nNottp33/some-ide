@@ -2,17 +2,18 @@
 /**
  * somed command line.
  *
- *   node packages/somed/src/cli.ts serve [--port 7700] [--host 127.0.0.1] [--no-tls]
+ *   node packages/somed/src/cli.ts serve [--port 7700] [--host 127.0.0.1] [--root <dir>] [--pair] [--no-tls]
  *   node packages/somed/src/cli.ts pair
- *   node packages/somed/src/cli.ts client --host wss://localhost:7700 [--code 123456] [--fingerprint AB:CD…] [--shell bash]
+ *   node packages/somed/src/cli.ts client --host wss://localhost:7700 [--code 123456]
+ *          [--fingerprint AB:CD…] [--trust-new-fingerprint] [--insecure] [--shell bash] [--raw]
  *   node packages/somed/src/cli.ts replay <sessionId>
  *   node packages/somed/src/cli.ts devices
  */
 import { existsSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { DeviceRegistry, generatePairingCode, readPairingFile, writePairingFile } from './auth.ts'
-import { loadOrCreateDevice, RpcClientError, SomedClient } from './client.ts'
-import { certFingerprint, startDaemon } from './server.ts'
+import { loadOrCreateDevice, RpcClientError, savePin, serverKey, SomedClient, type ConnectOptions } from './client.ts'
+import { certFingerprint, installCrashGuards, startDaemon } from './server.ts'
 import { SessionStore, foldBlocks } from './store.ts'
 import { dataDir } from './util.ts'
 
@@ -35,10 +36,13 @@ function parseArgs(argv: string[]): { cmd: string; positional: string[]; flags: 
 function usage(): void {
   console.log(`somed - per-user host daemon for the IDE (prototype)
 
-  serve   [--port 7700] [--host 127.0.0.1] [--no-tls]       start the daemon
+  serve   [--port 7700] [--host 127.0.0.1] [--root <dir>]     start the daemon; fs.* and session cwds are
+          [--pair] [--no-tls] [--stats]                        confined to --root (default: current directory);
+                                                            --pair prints a pairing code at startup
   pair                                                      print (or create) the current pairing code
-  client  --host wss://localhost:7700 [--code 123456]       demo client: pair, authenticate, run commands
-          [--fingerprint AB:CD:..] [--shell bash] [--raw]
+  client  --host wss://localhost:7700 [--code 123456]       demo client: pair, authenticate, run commands;
+          [--fingerprint AB:CD:..] [--shell bash] [--raw]     the certificate seen while pairing is pinned in
+          [--trust-new-fingerprint] [--insecure]              device.json; --insecure skips verification
   replay  <sessionId>                                       print the persisted blocks of a session
   devices                                                   list paired devices
 
@@ -46,13 +50,17 @@ Data directory: ${dataDir()}  (override with $SOMED_HOME)`)
 }
 
 async function serve(flags: Record<string, string | boolean>): Promise<void> {
+  installCrashGuards((m) => console.error(m))
   const daemon = await startDaemon({
     port: Number(flags.port ?? 7700),
     host: typeof flags.host === 'string' ? flags.host : '127.0.0.1',
     dataDir: dataDir(),
+    root: typeof flags.root === 'string' ? flags.root : process.cwd(),
     tls: flags['no-tls'] !== true,
   })
   console.log(`Data directory: ${dataDir()}`)
+  if (flags.pair === true) daemon.pairing.start()
+  else console.log('Run `somed pair` (on this host) to print a pairing code for a new device.')
   console.log('Press Ctrl+C to stop. Sessions survive client disconnects but not a daemon restart (block logs do).')
   const shutdown = async () => {
     console.log('\nshutting down…')
@@ -65,7 +73,7 @@ async function serve(flags: Record<string, string | boolean>): Promise<void> {
   if (flags.stats === true) {
     setInterval(() => {
       const m = process.memoryUsage()
-      console.log(`[stats] rss=${(m.rss / 1048576).toFixed(1)}MiB heap=${(m.heapUsed / 1048576).toFixed(1)}MiB sessions=${daemon.sessions.list().length}`)
+      console.log(`[stats] rss=${(m.rss / 1048576).toFixed(1)}MiB heap=${(m.heapUsed / 1048576).toFixed(1)}MiB sessions=${daemon.sessions.liveCount}`)
     }, 5000).unref()
   }
 }
@@ -99,7 +107,14 @@ function replay(sessionId: string | undefined): void {
     console.log(ids.length ? `sessions:\n  ${ids.join('\n  ')}` : 'no persisted sessions')
     return
   }
-  const events = store.read(sessionId)
+  const events = []
+  let fromSeq = 0
+  for (;;) {
+    const page = store.read(sessionId, fromSeq)
+    if (page.length === 0) break
+    events.push(...page)
+    fromSeq = page[page.length - 1]!.seq
+  }
   if (events.length === 0) {
     console.log(`no events for session ${sessionId}`)
     return
@@ -108,7 +123,7 @@ function replay(sessionId: string | undefined): void {
   if (meta && meta.type === 'session.meta') console.log(`session ${meta.id}  shell=${meta.shell}  cwd=${meta.cwd}  created=${new Date(meta.createdAt).toISOString()}`)
   for (const b of foldBlocks(events)) {
     const status = b.exitCode === undefined ? '?' : String(b.exitCode)
-    console.log(`\n┌─ [${b.id}] ${b.cwd} $ ${b.commandLine}${b.tui ? '   (tui)' : ''}`)
+    console.log(`\n┌─ [${b.id}] ${b.cwd} $ ${b.commandLine}${b.tui ? '   (tui)' : ''}${b.truncated ? '   (truncated)' : ''}`)
     if (b.output) console.log(b.output.replace(/\n$/, '').split('\n').map((l) => `│ ${l}`).join('\n'))
     console.log(`└─ exit ${status}  ${b.durationMs ?? '?'} ms`)
   }
@@ -120,9 +135,42 @@ function replay(sessionId: string | undefined): void {
 async function client(flags: Record<string, string | boolean>): Promise<void> {
   const url = typeof flags.host === 'string' ? flags.host : 'wss://localhost:7700'
   const device = loadOrCreateDevice(join(dataDir(), 'client'))
-  const fingerprint = typeof flags.fingerprint === 'string' ? flags.fingerprint : undefined
-  console.log(`connecting to ${url} as device "${device.name}"${fingerprint ? ' (pinned certificate)' : ''}`)
-  const c = await SomedClient.connect(url, { insecure: true, fingerprint })
+  const code = typeof flags.code === 'string' || typeof flags.code === 'number' ? String(flags.code) : undefined
+  const key = serverKey(url)
+  const pinned = device.pins[key]
+  let options: ConnectOptions
+  let pinAfter: 'pairing' | 'connect' | 'never' = 'never'
+  if (flags.insecure === true) {
+    console.error('WARNING: --insecure accepts any TLS certificate; a relay could read everything on this connection.')
+    options = { insecure: true }
+  } else if (typeof flags.fingerprint === 'string') {
+    options = { fingerprint: flags.fingerprint }
+  } else if (flags['trust-new-fingerprint'] === true) {
+    options = { trustOnFirstUse: true }
+    pinAfter = 'connect'
+  } else if (pinned) {
+    options = { fingerprint: pinned }
+  } else if (code) {
+    options = { trustOnFirstUse: true }
+    pinAfter = 'pairing'
+  } else {
+    throw new Error(`no pinned certificate for ${key}: pair first (--code, pins the certificate seen then), pass --fingerprint, or --insecure`)
+  }
+  console.log(`connecting to ${url} as device "${device.name}"${options.fingerprint ? ' (pinned certificate)' : ''}`)
+  let c: SomedClient
+  try {
+    c = await SomedClient.connect(url, options)
+  } catch (err) {
+    if (pinned && /fingerprint mismatch/.test(String((err as Error).message))) {
+      throw new Error(`${(err as Error).message}\nThe daemon's certificate changed since pairing. If that is expected, run again with --trust-new-fingerprint.`)
+    }
+    throw err
+  }
+  if (!c.peerFingerprint && !url.startsWith('ws://')) console.error('WARNING: no TLS certificate seen; nothing is pinned')
+  if (pinAfter === 'connect' && c.peerFingerprint) {
+    savePin(device, key, c.peerFingerprint)
+    console.log(`pinned certificate ${c.peerFingerprint} for ${key}${pinned ? ` (was ${pinned})` : ''}`)
+  }
   const raw = flags.raw === true
   c.onNotification((method, params) => {
     if (method === 'session.data') {
@@ -135,14 +183,18 @@ async function client(flags: Record<string, string | boolean>): Promise<void> {
     }
   })
   try {
-    if (typeof flags.code === 'string' || typeof flags.code === 'number') {
-      await c.pair(device, String(flags.code))
+    if (code) {
+      await c.pair(device, code)
       console.log('paired')
+      if (pinAfter === 'pairing' && c.peerFingerprint) {
+        savePin(device, key, c.peerFingerprint)
+        console.log(`pinned certificate ${c.peerFingerprint} for ${key}`)
+      }
     }
     await c.authenticate(device)
     console.log('authenticated')
-    const info = await c.call<{ shells: string[]; tls: boolean; fingerprint?: string }>('server.info')
-    console.log(`server: tls=${info.tls} shells=${info.shells.join(',')}${info.fingerprint ? ` fingerprint=${info.fingerprint}` : ''}`)
+    const info = await c.call<{ shells: string[]; tls: boolean; fingerprint?: string; root: string }>('server.info')
+    console.log(`server: tls=${info.tls} shells=${info.shells.join(',')} root=${info.root}${info.fingerprint ? ` fingerprint=${info.fingerprint}` : ''}`)
     const session = await c.call<{ id: string }>('session.create', { shell: typeof flags.shell === 'string' ? flags.shell : 'bash', cols: 100, rows: 30 })
     console.log(`session ${session.id} created; waiting for the first prompt`)
     const exited = c.waitFor((m, p) => m === 'session.exit' && p.sessionId === session.id, 30_000)
@@ -154,7 +206,7 @@ async function client(flags: Record<string, string | boolean>): Promise<void> {
       await c.call('session.input', { id: session.id, data: cmd + '\r' })
       await done
     }
-    const replayed = await c.call<{ events: unknown[] }>('session.attach', { id: session.id, fromSeq: 0 })
+    const replayed = await c.attach(session.id, 0)
     console.log(`replay of ${session.id}: ${replayed.events.length} persisted events`)
   } catch (err) {
     if (err instanceof RpcClientError) console.error(`rpc error ${err.code}: ${err.message}`)
