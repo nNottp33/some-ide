@@ -1,0 +1,33 @@
+diff --git a/product.json b/product.json
+index 64e1c4d2..7851e0fd 100644
+--- a/product.json
++++ b/product.json
+@@ -1,8 +1,8 @@
+ {
+-	"nameShort": "Code - OSS",
+-	"nameLong": "Code - OSS",
+-	"applicationName": "code-oss",
+-	"dataFolderName": ".vscode-oss",
++	"nameShort": "Some IDE",
++	"nameLong": "Some IDE",
++	"applicationName": "some-ide",
++	"dataFolderName": ".some-ide",
+ 	"sharedDataFolderName": ".vscode-oss-shared",
+ 	"win32MutexName": "vscodeoss",
+ 	"licenseName": "MIT",
+@@ -246,5 +246,14 @@
+ 		"GitHub.copilot-chat"
+ 	],
+ 	"sessionsWindowAllowedExtensions": [],
+-	"voiceWsUrl": "wss://falcon-caas.mai.microsoft.com/voice-code/api/v1/realtime/voice"
++	"voiceWsUrl": "wss://falcon-caas.mai.microsoft.com/voice-code/api/v1/realtime/voice",
++	"extensionsGallery": {
++		"serviceUrl": "https://open-vsx.org/vscode/gallery",
++		"itemUrl": "https://open-vsx.org/vscode/item",
++		"latestUrlTemplate": "https://open-vsx.org/vscode/gallery/{publisher}/{name}/latest",
++		"controlUrl": "https://raw.githubusercontent.com/EclipseFdn/publish-extensions/refs/heads/master/extension-control/extensions.json"
++	},
++	"linkProtectionTrustedDomains": [
++		"https://open-vsx.org"
++	]
+ }
