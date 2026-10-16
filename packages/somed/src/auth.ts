@@ -1,14 +1,21 @@
 /**
  * Device pairing and authentication.
  *
- * Pairing: the daemon prints a 6-digit code (`pair.start` or `somed pair`); the client sends it
- * together with its Ed25519 public key (`pair.complete`). Paired devices are stored in
- * <dataDir>/devices.json. The current code is also written to <dataDir>/pairing.json so the
- * `somed pair` CLI and the server share it.
+ * Pairing: a 6-digit code is created on the host side only (the `somed pair` CLI or `somed serve
+ * --pair`; both write <dataDir>/pairing.json and print the code). The network can only ask
+ * whether a code is pending (`pair.start`) and present a guess together with an Ed25519 public
+ * key (`pair.complete`). Paired devices are stored in <dataDir>/devices.json.
  *
- * Authentication: `auth.challenge {devicePublicKey}` returns a random nonce; the client signs it
- * with its private key and sends `auth.verify {signature}`. Verification uses Node's built-in
- * Ed25519 support (crypto.verify with a null algorithm).
+ * Brute force: a code is single use, expires after 5 minutes and dies after 5 wrong guesses.
+ * On top of that, failed `pair.complete` calls are counted globally (whatever the code): 5
+ * failures within 5 minutes lock pairing for 60 s, doubling on every further lockout (1 h cap).
+ *
+ * Authentication: `auth.challenge {devicePublicKey}` returns a random nonce; the client signs
+ *   "somed-auth-v1" || sha256(server certificate DER) || nonce
+ * with its private key and sends `auth.verify {signature}`. The certificate hash binds the
+ * signature to the TLS channel the client actually sees: a relay with its own certificate cannot
+ * forward the signature to the real daemon. Without TLS the hash is 32 zero bytes (and the
+ * channel offers no protection at all). Verification uses Node's built-in Ed25519 support.
  */
 import { createPublicKey, randomBytes, randomInt, timingSafeEqual, verify as cryptoVerify, type KeyObject } from 'node:crypto'
 import { existsSync, readFileSync, writeFileSync } from 'node:fs'
@@ -27,11 +34,33 @@ export interface PairingCode {
   expiresAt: number
 }
 
-const CODE_TTL_MS = 5 * 60 * 1000
-const MAX_ATTEMPTS = 5
+export const CODE_TTL_MS = 5 * 60 * 1000
+/** Wrong guesses a single code survives. */
+export const MAX_ATTEMPTS_PER_CODE = 5
+/** Failed `pair.complete` calls (any code, any reason) within FAILURE_WINDOW_MS that trigger a lockout. */
+export const MAX_FAILURES = 5
+export const FAILURE_WINDOW_MS = 5 * 60 * 1000
+export const LOCKOUT_MS = 60 * 1000
+export const MAX_LOCKOUT_MS = 60 * 60 * 1000
+/** A lockout streak is forgotten after this much time without a failure. */
+const LOCKOUT_DECAY_MS = 60 * 60 * 1000
+
+/** Domain separation prefix of the authentication payload. */
+export const AUTH_PREFIX = Buffer.from('somed-auth-v1', 'utf8')
+/** Channel binding used when the connection is not TLS protected. */
+export const NO_CHANNEL_BINDING: Buffer = Buffer.alloc(32)
 
 export function generatePairingCode(): string {
   return randomInt(0, 1_000_000).toString().padStart(6, '0')
+}
+
+/** Device names end up in logs and in devices.json: drop control characters and cap the length. */
+export function sanitizeDeviceName(name: unknown): string {
+  const clean = String(name ?? '')
+    .replace(/[\x00-\x1f\x7f]/g, '')
+    .trim()
+    .slice(0, 80)
+  return clean.length > 0 ? clean : 'device'
 }
 
 export function readPairingFile(dataDir: string): PairingCode | undefined {
@@ -70,6 +99,24 @@ export function canonicalPublicKey(key: KeyObject): string {
   return (key.export({ type: 'spki', format: 'der' }) as Buffer).toString('base64')
 }
 
+/**
+ * The bytes a device signs to authenticate: "somed-auth-v1" || sha256(server cert DER) || nonce.
+ * `certHash` is the SHA-256 of the server certificate as the client observed it on the TLS socket
+ * (undefined / 32 zero bytes without TLS). Both sides build the payload with this function.
+ */
+export function authPayload(certHash: Buffer | undefined, nonce: Buffer): Buffer {
+  const binding = certHash && certHash.length > 0 ? certHash : NO_CHANNEL_BINDING
+  if (binding.length !== 32) throw new Error('certificate hash must be 32 bytes')
+  return Buffer.concat([AUTH_PREFIX, binding, nonce])
+}
+
+/** Parse a colon separated hex fingerprint ("AB:CD:…", as `getPeerCertificate().fingerprint256`) into bytes. */
+export function fingerprintToBuffer(fingerprint: string): Buffer {
+  const hex = fingerprint.replace(/[^0-9a-fA-F]/g, '')
+  if (hex.length !== 64) throw new Error('fingerprint must be a SHA-256 hex digest')
+  return Buffer.from(hex, 'hex')
+}
+
 export class DeviceRegistry {
   readonly path: string
   #devices: PairedDevice[] = []
@@ -102,7 +149,7 @@ export class DeviceRegistry {
 
   add(device: PairedDevice): void {
     this.#devices = this.#devices.filter((d) => d.publicKey !== device.publicKey)
-    this.#devices.push(device)
+    this.#devices.push({ ...device, name: sanitizeDeviceName(device.name) })
     this.#save()
   }
 
@@ -122,12 +169,21 @@ export class DeviceRegistry {
   }
 }
 
+export type PairingResult =
+  | { ok: true; device: PairedDevice }
+  | { ok: false; error: string; locked?: boolean; retryAfterMs?: number }
+
 export class Pairing {
   readonly #dataDir: string
   readonly #registry: DeviceRegistry
   readonly #log: (msg: string) => void
   #current: PairingCode | undefined
   #attempts = 0
+  /** Timestamps of recent failed `complete` calls (any code). */
+  #failures: number[] = []
+  #lockedUntil = 0
+  #lockouts = 0
+  #lastFailureAt = 0
 
   constructor(dataDir: string, registry: DeviceRegistry, log: (msg: string) => void = () => {}) {
     this.#dataDir = dataDir
@@ -135,7 +191,11 @@ export class Pairing {
     this.#log = log
   }
 
-  /** Create (or re-use a still valid) pairing code; prints it on the server console. */
+  /**
+   * Create (or re-use a still valid) pairing code and print it on the daemon console. This is a
+   * host-side operation (`somed pair`, `somed serve --pair`); it is deliberately not reachable
+   * over the network, otherwise a remote client could mint fresh codes after every lockout.
+   */
   start(): PairingCode {
     const existing = this.current()
     if (existing) return existing
@@ -158,39 +218,76 @@ export class Pairing {
     return this.#current && this.#current.expiresAt > Date.now() ? this.#current : undefined
   }
 
-  complete(code: string, devicePublicKey: string, deviceName: string): { ok: true; device: PairedDevice } | { ok: false; error: string } {
+  /** What `pair.start` may tell the network: whether a code is pending and until when. */
+  status(): { pending: boolean; expiresAt?: number; lockedForMs: number } {
+    const c = this.current()
+    return { pending: c !== undefined, expiresAt: c?.expiresAt, lockedForMs: this.lockedForMs() }
+  }
+
+  /** Milliseconds until `complete` accepts attempts again (0 when not locked). */
+  lockedForMs(now = Date.now()): number {
+    return Math.max(0, this.#lockedUntil - now)
+  }
+
+  complete(code: string, devicePublicKey: string, deviceName: string): PairingResult {
+    const now = Date.now()
+    const locked = this.lockedForMs(now)
+    if (locked > 0) {
+      return { ok: false, error: `pairing locked after too many failed attempts, retry in ${Math.ceil(locked / 1000)} s`, locked: true, retryAfterMs: locked }
+    }
     const key = importPublicKey(devicePublicKey)
-    if (!key) return { ok: false, error: 'devicePublicKey must be a base64 SPKI DER Ed25519 public key' }
+    if (!key) return this.#fail(now, 'devicePublicKey must be a base64 SPKI DER Ed25519 public key')
     const current = this.current()
-    if (!current) return { ok: false, error: 'no pairing in progress (call pair.start or run `somed pair`)' }
+    if (!current) return this.#fail(now, 'no pairing in progress (run `somed pair` on the host)')
     const a = Buffer.from(String(code))
     const b = Buffer.from(current.code)
     if (a.length !== b.length || !timingSafeEqual(a, b)) {
       this.#attempts++
-      if (this.#attempts >= MAX_ATTEMPTS) {
+      if (this.#attempts >= MAX_ATTEMPTS_PER_CODE) {
         this.#current = undefined
         writePairingFile(this.#dataDir, undefined)
-        return { ok: false, error: 'too many attempts, pairing code invalidated' }
+        return this.#fail(now, 'too many attempts, pairing code invalidated')
       }
-      return { ok: false, error: 'wrong pairing code' }
+      return this.#fail(now, 'wrong pairing code')
     }
     this.#current = undefined
     writePairingFile(this.#dataDir, undefined)
-    const device: PairedDevice = { publicKey: canonicalPublicKey(key), name: String(deviceName || 'device').slice(0, 80), pairedAt: Date.now() }
+    this.#failures = []
+    this.#lockouts = 0
+    const device: PairedDevice = { publicKey: canonicalPublicKey(key), name: sanitizeDeviceName(deviceName), pairedAt: now }
     this.#registry.add(device)
     this.#log(`  Paired device "${device.name}"`)
     return { ok: true, device }
+  }
+
+  #fail(now: number, error: string): PairingResult {
+    if (now - this.#lastFailureAt > LOCKOUT_DECAY_MS) this.#lockouts = 0
+    this.#lastFailureAt = now
+    this.#failures = this.#failures.filter((t) => now - t < FAILURE_WINDOW_MS)
+    this.#failures.push(now)
+    if (this.#failures.length >= MAX_FAILURES) {
+      const duration = Math.min(LOCKOUT_MS * 2 ** this.#lockouts, MAX_LOCKOUT_MS)
+      this.#lockouts++
+      this.#lockedUntil = now + duration
+      this.#failures = []
+      this.#log(`  pairing locked for ${Math.round(duration / 1000)} s after ${MAX_FAILURES} failed attempts`)
+      return { ok: false, error: `${error}; pairing locked for ${Math.round(duration / 1000)} s`, locked: true, retryAfterMs: duration }
+    }
+    return { ok: false, error }
   }
 }
 
 /** Per-connection authentication state machine. */
 export class Authenticator {
   readonly #registry: DeviceRegistry
+  /** SHA-256 of the daemon's own certificate DER (undefined without TLS). */
+  readonly #certHash: Buffer | undefined
   #pending: { publicKey: string; key: KeyObject; nonce: Buffer; expiresAt: number } | undefined
   #device: PairedDevice | undefined
 
-  constructor(registry: DeviceRegistry) {
+  constructor(registry: DeviceRegistry, certHash?: Buffer) {
     this.#registry = registry
+    this.#certHash = certHash
   }
 
   get device(): PairedDevice | undefined {
@@ -224,7 +321,7 @@ export class Authenticator {
     }
     let valid = false
     try {
-      valid = cryptoVerify(null, pending.nonce, pending.key, sig)
+      valid = cryptoVerify(null, authPayload(this.#certHash, pending.nonce), pending.key, sig)
     } catch {
       valid = false
     }
