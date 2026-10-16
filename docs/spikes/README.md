@@ -12,6 +12,7 @@
 | 3 | ข้อความไทยบน Monaco (desktop) | cloud session | ✅ เสร็จ | [`thai-monaco-desktop.md`](thai-monaco-desktop.md) |
 | 4 | Android: `forkpty` ของ `/system/bin/sh` + zsh ที่ bundle เป็น `.so` ใต้กฎ W^X | ต้องใช้ Android SDK/NDK + เครื่องจริง | ⏳ ยังไม่เริ่ม — ทำบนเครื่องของผู้พัฒนา | — |
 | 5 | จับคู่โทรศัพท์-โน้ตบุ๊ก (QR + device key + TLS) | ส่วนหนึ่งของ #2 (ฝั่ง daemon) + ต้องมีแอปมือถือ | 🔄 ฝั่ง daemon กำลังทำ | — |
+| 1b | แผนที่ API ภายใน VS Code ที่ `terminalContrib/blocks` ต้องใช้ + จุดเปราะ 10 ข้อ | cloud session (อ่าน source 1.141.0) | ✅ เสร็จ | [`vscode-terminal-api-map.md`](vscode-terminal-api-map.md) |
 | — | ตรวจว่า basedpyright, clangd, CodeLLDB, debugpy, Jupyter มีบน Open VSX | ต้องทำจากเครื่องที่เข้า open-vsx.org ได้ (cloud session เข้าไม่ได้) | ⏳ ยังไม่เริ่ม | — |
 
 ข้อจำกัดของ cloud session ที่ใช้ทำ spike: ไม่มีจอ/GPU (ทดสอบผ่าน Chromium headless เท่านั้น), ไม่มี Android SDK, macOS, Xcode หรือ WebKit,
