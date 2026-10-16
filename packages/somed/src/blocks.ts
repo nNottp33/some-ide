@@ -89,6 +89,8 @@ export class BlockDetector {
   #promptX = 0
   #inputMarker: IMarker | undefined
   #inputX = 0
+  /** Continuation prompt (PS2) ranges printed while the user typed a multi-line command (F..G). */
+  #continuations: { marker: IMarker; fromX: number; toX: number }[] = []
   #current: ActiveBlock | undefined
   #disposed = false
   #writes = 0
@@ -154,10 +156,11 @@ export class BlockDetector {
     if (!this.#disposed) this.terminal.resize(cols, rows)
   }
 
-  dispose(): void {
+  /** Dispose the detector; a block still running is ended with `exitCode` (e.g. the shell's exit code). */
+  dispose(exitCode?: number): void {
     if (this.#disposed) return
     this.#disposed = true
-    if (this.#current) this.#finish(undefined)
+    if (this.#current) this.#finish(exitCode)
     this.#events.clear()
     this.terminal.dispose()
   }
@@ -195,8 +198,18 @@ export class BlockDetector {
         }
         return true
       }
+      case 'F': {
+        const marker = this.terminal.registerMarker(0)
+        if (marker) this.#continuations.push({ marker, fromX: this.terminal.buffer.active.cursorX, toX: -1 })
+        return true
+      }
+      case 'G': {
+        const last = this.#continuations[this.#continuations.length - 1]
+        if (last && last.toX === -1) last.toX = this.terminal.buffer.active.cursorX
+        return true
+      }
       default:
-        // F, G (continuation prompt), H, I (right prompt), SetMark, Env* — accepted and ignored.
+        // H, I (right prompt), SetMark, Env* — accepted and ignored.
         return true
     }
   }
@@ -216,27 +229,42 @@ export class BlockDetector {
     this.#inputMarker?.dispose()
     this.#inputMarker = this.terminal.registerMarker(0)
     this.#inputX = this.terminal.buffer.active.cursorX
+    for (const c of this.#continuations) c.marker.dispose()
+    this.#continuations = []
     return true
   }
 
   #handleCommandExecuted(): boolean {
     if (this.#current) return true // duplicate C — keep the running block
     const buf = this.terminal.buffer.active
-    const id = `${this.#idPrefix}${++this.#blockCounter}`
-    const ts = Date.now()
     const pending = this.#pendingCommandLine
     this.#pendingCommandLine = undefined
+    const typed = this.#typedText().replace(/\s+$/, '')
     let commandLine: string
     let trusted: boolean
-    if (pending && pending.trusted) {
-      commandLine = pending.text
-      trusted = true
+    if (pending?.trusted) {
+      const fromShell = pending.text.replace(/\n$/, '')
+      if (fromShell.length > 0 && typed.length > fromShell.length && typed.startsWith(fromShell)) {
+        // bash reports only the first simple command ($BASH_COMMAND) when HISTCONTROL contains
+        // ignore*/erasedups; what the user typed is the better description of the block then.
+        commandLine = typed
+        trusted = false
+      } else {
+        commandLine = fromShell
+        trusted = true
+      }
     } else {
-      // Untrusted or missing E: fall back to what the user typed between B and now.
-      const typed = this.#textBetween(this.#inputMarker, this.#inputX, buf.baseY + buf.cursorY, buf.cursorX)
-      commandLine = pending?.text ?? typed.trim()
+      commandLine = pending?.text.replace(/\n$/, '') || typed
       trusted = false
     }
+    if (commandLine.trim().length === 0) {
+      // Enter on an empty line: bash still runs PROMPT_COMMAND through the DEBUG trap, which emits
+      // E (empty) + C + D. That is not a block.
+      this.#state = 'executing'
+      return true
+    }
+    const id = `${this.#idPrefix}${++this.#blockCounter}`
+    const ts = Date.now()
     const prompt = this.#textBetween(this.#promptMarker, this.#promptX, this.#inputMarker?.line ?? -1, this.#inputX)
     this.#current = {
       id,
@@ -256,6 +284,30 @@ export class BlockDetector {
     this.#events.fire({ type: 'block.start', id, ts })
     this.#events.fire({ type: 'block.command', id, commandLine, cwd: this.#cwd, trusted, prompt: prompt || undefined })
     return true
+  }
+
+  /** What the user typed after the prompt (between B and the cursor), continuation prompts removed. */
+  #typedText(): string {
+    const buf = this.terminal.buffer.active
+    const startLine = this.#inputMarker?.line ?? -1
+    const cursorLine = buf.baseY + buf.cursorY
+    if (startLine < 0 || cursorLine < startLine) return ''
+    const parts: string[] = []
+    for (let y = startLine; y <= cursorLine; y++) {
+      const line = buf.getLine(y)
+      if (!line) break
+      const next = buf.getLine(y + 1)
+      const continues = y < cursorLine && next?.isWrapped === true
+      let text =
+        y === cursorLine ? line.translateToString(true, 0, buf.cursorX) : line.translateToString(!continues, 0)
+      for (const c of this.#continuations) {
+        if (c.marker.line === y && c.toX > c.fromX) text = text.slice(0, c.fromX) + text.slice(c.toX)
+      }
+      if (y === startLine) text = text.slice(this.#inputX)
+      parts.push(text)
+      if (y < cursorLine && !continues) parts.push('\n')
+    }
+    return parts.join('')
   }
 
   #handleCommandFinished(exitCodeArg: string | undefined): boolean {
