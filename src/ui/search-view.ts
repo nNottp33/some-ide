@@ -1,7 +1,7 @@
 import { debounce } from '../core/emitter'
 import { basename, dirname } from '../core/path'
-import { buildSearchRegex, searchFiles, type SearchOptions, type SearchResults } from '../core/search'
-import type { DocumentManager } from '../editor/documents'
+import { buildSearchRegex, replaceInText, searchFiles, type SearchOptions, type SearchResults } from '../core/search'
+import type { Document as EditorDocument, DocumentManager } from '../editor/documents'
 import { confirmDialog, notify } from './dialogs'
 import { h, icon, iconButton } from './dom'
 import { fileIcon } from './file-icon'
@@ -177,23 +177,25 @@ export class SearchView {
     const query = this.queryInput.value
     if (!query || !this.last?.total) return
     const replacement = this.replaceInput.value
-    const files = this.last.files.map((f) => f.path)
+    const regex = buildSearchRegex({ query, ...this.options })
+    // Replace exactly the matches the search reports, in every file (also beyond the result limit).
+    const changes: Array<{ doc: EditorDocument; text: string; count: number }> = []
+    for (const [path, text] of this.deps.docs.contents()) {
+      const doc = this.deps.docs.get(path)
+      if (!doc) continue
+      const result = replaceInText(text, regex, replacement, this.options.regex)
+      if (result.count) changes.push({ doc, ...result })
+    }
+    const total = changes.reduce((n, c) => n + c.count, 0)
+    if (!total) return
     const ok = await confirmDialog(
       'Replace All',
-      `Replace ${this.last.total} occurrence(s) across ${files.length} file(s) with "${replacement}"? Files are left unsaved so you can review or undo.`,
+      `Replace ${total} occurrence(s) across ${changes.length} file(s) with "${replacement}"? Files are left unsaved so you can review or undo.`,
       'Replace',
     )
     if (!ok) return
-    const base = buildSearchRegex({ query, ...this.options })
-    const regex = new RegExp(base.source, base.flags + 'm')
-    for (const path of files) {
-      const doc = this.deps.docs.get(path)
-      if (!doc) continue
-      const text = doc.model.getValue()
-      const next = this.options.regex ? text.replace(regex, replacement) : text.replace(regex, () => replacement)
-      if (next !== text) this.deps.docs.replaceText(doc, next)
-    }
-    notify(`Replaced in ${files.length} file(s). Save with Ctrl+S or Save All.`)
+    for (const { doc, text } of changes) this.deps.docs.replaceText(doc, text)
+    notify(`Replaced ${total} occurrence(s) in ${changes.length} file(s). Save with Ctrl+S or Save All.`)
     this.search()
   }
 }

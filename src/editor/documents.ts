@@ -109,18 +109,19 @@ export class DocumentManager {
     const model = monaco.editor.createModel(content, languageForPath(path).id, uri)
     model.updateOptions({ tabSize: this.tabSize, indentSize: this.tabSize, insertSpaces: true })
     const doc: Document = { path, model, savedVersion: model.getAlternativeVersionId() }
-    if (dirtyFrom !== undefined && dirtyFrom !== content) {
-      // A dirty file was moved: keep the unsaved text and the dirty marker.
-      model.setValue(dirtyFrom)
-      doc.savedVersion = -1
-    }
     model.onDidChangeContent(() => {
       this.updateDirty(doc)
       this.onDidChangeContent.emit({ path: doc.path })
     })
     this.docs.set(path, doc)
     this.byUri.set(uri.toString(), path)
-    this.dirtyState.set(path, this.isDirty(path))
+    this.dirtyState.set(path, false)
+    if (dirtyFrom !== undefined && dirtyFrom !== content) {
+      // A dirty file was moved: keep the unsaved text and the dirty marker. Done after the
+      // listener is attached so the change is reported like any other edit.
+      doc.savedVersion = -1
+      model.setValue(dirtyFrom)
+    }
     return doc
   }
 

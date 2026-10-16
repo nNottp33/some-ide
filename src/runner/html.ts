@@ -8,9 +8,21 @@
  */
 import { dirname, extname, join, normalize } from '../core/path'
 import { formatArgs, inspect } from './inspect'
-import { isUrlSpecifier, linkModules } from './modules'
+import { ESM_CDN, isUrlSpecifier, linkModules } from './modules'
 
 const PROJECT_PREFIX = '@project'
+
+interface ImportMapJson {
+  imports?: Record<string, string>
+  scopes?: Record<string, Record<string, string>>
+  integrity?: Record<string, string>
+}
+
+/** Import-map matching: an exact key, or the longest key ending in "/" that prefixes `spec`. */
+export function importMapDefines(imports: Record<string, string>, spec: string): boolean {
+  if (Object.prototype.hasOwnProperty.call(imports, spec)) return true
+  return Object.keys(imports).some((key) => key.endsWith('/') && spec.startsWith(key))
+}
 
 export interface PreviewBuild {
   html: string
@@ -116,6 +128,21 @@ export async function buildPreview(files: ReadonlyMap<string, string>, entry: st
   const dir = dirname(entry)
   const importMap: Record<string, string> = {}
 
+  // The page's own import map wins for the bare imports it defines (an exact key, or a
+  // "prefix/" key); everything else is fetched from esm.sh.
+  const existingMap = doc.querySelector('script[type="importmap"]')
+  let userMap: ImportMapJson = {}
+  if (existingMap) {
+    try {
+      const parsed: unknown = JSON.parse(existingMap.textContent || '{}')
+      if (parsed && typeof parsed === 'object') userMap = parsed as ImportMapJson
+    } catch {
+      warnings.push(`${entry}: the existing import map is not valid JSON and was replaced`)
+    }
+  }
+  const userImports = userMap.imports ?? {}
+  const resolveBare = (spec: string) => (importMapDefines(userImports, spec) ? null : ESM_CDN + spec)
+
   const localPath = (ref: string | null): string | null => {
     if (!ref || isUrlSpecifier(ref) || ref.startsWith('//') || ref.startsWith('#')) return null
     const clean = ref.split(/[?#]/)[0]
@@ -152,7 +179,7 @@ export async function buildPreview(files: ReadonlyMap<string, string>, entry: st
       if (!path) continue
       script.removeAttribute('src')
       if (isModule || /\.(ts|tsx|jsx|mts)$/.test(path)) {
-        const specifier = await linkModules({ files, entry: path, target: 'browser', emit })
+        const specifier = await linkModules({ files, entry: path, target: 'browser', emit, resolveBare })
         script.setAttribute('type', 'module')
         script.textContent = `import ${JSON.stringify(specifier)};`
       } else {
@@ -161,7 +188,7 @@ export async function buildPreview(files: ReadonlyMap<string, string>, entry: st
     } else if (isModule && script.textContent?.trim()) {
       const virtualPath = join(dir, `${entry.split('/').pop()}.inline-${++inlineModules}.js`)
       const withInline = new Map(files).set(virtualPath, script.textContent)
-      const specifier = await linkModules({ files: withInline, entry: virtualPath, target: 'browser', emit })
+      const specifier = await linkModules({ files: withInline, entry: virtualPath, target: 'browser', emit, resolveBare })
       script.textContent = `import ${JSON.stringify(specifier)};`
     }
   }
@@ -177,20 +204,14 @@ export async function buildPreview(files: ReadonlyMap<string, string>, entry: st
 
   const bridge = doc.createElement('script')
   bridge.textContent = escapeScript(bridgeScript(files, entry))
-  const existingMap = doc.querySelector('script[type="importmap"]')
+  const merged = scriptJson({ ...userMap, imports: { ...userImports, ...importMap } })
   if (existingMap) {
-    try {
-      const parsed = JSON.parse(existingMap.textContent || '{}') as { imports?: Record<string, string> }
-      parsed.imports = { ...parsed.imports, ...importMap }
-      existingMap.textContent = scriptJson(parsed)
-    } catch {
-      warnings.push(`${entry}: the existing import map is not valid JSON`)
-    }
+    existingMap.textContent = merged
     doc.head.prepend(bridge)
   } else {
     const mapScript = doc.createElement('script')
     mapScript.setAttribute('type', 'importmap')
-    mapScript.textContent = scriptJson({ imports: importMap })
+    mapScript.textContent = merged
     doc.head.prepend(bridge, mapScript)
   }
 

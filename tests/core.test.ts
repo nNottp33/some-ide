@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from 'vitest'
 import { fuzzyFilter, fuzzyMatch } from '../src/core/fuzzy'
 import { languageForPath, runtimeForPath } from '../src/core/languages'
 import { basename, dirname, extname, isWithin, join, normalize, rebase, resolveRelative, validateName } from '../src/core/path'
-import { buildSearchRegex, searchFiles, searchText } from '../src/core/search'
+import { buildSearchRegex, replaceInText, searchFiles, searchText } from '../src/core/search'
 import { FsError, VirtualFS, type FsEvent } from '../src/core/vfs'
 import { exportZip, importZip, isProbablyBinary } from '../src/core/zip'
 import { strToU8, zipSync } from 'fflate'
@@ -158,6 +158,25 @@ describe('search', () => {
     const big: Array<[string, string]> = [['/x', 'a\n'.repeat(50)]]
     const results = searchFiles(big, { query: 'a' }, 10)
     expect(results.total).toBe(10)
+  })
+})
+
+describe('replaceInText', () => {
+  it('replaces only what the search reports, per line', () => {
+    const text = 'cat\nfoo   bar\nbaz'
+    const regex = buildSearchRegex({ query: '\\s+', regex: true })
+    expect(searchText(text, regex)).toHaveLength(1)
+    expect(replaceInText(text, regex, '_', true)).toEqual({ text: 'cat\nfoo_bar\nbaz', count: 1 })
+    // Empty matches are not matches: a* must not sprinkle replacements between characters.
+    expect(replaceInText('abc', buildSearchRegex({ query: 'a*', regex: true }), '-', true)).toEqual({ text: '-bc', count: 1 })
+    expect(replaceInText('a.b\r\na.b', buildSearchRegex({ query: '.' }), '!', false)).toEqual({ text: 'a!b\r\na!b', count: 2 })
+  })
+
+  it('expands $-patterns only in regex mode', () => {
+    const regex = buildSearchRegex({ query: '(\\w+)@(?<host>\\w+)', regex: true })
+    expect(replaceInText('me@site x', regex, '$2/$1 [$&] $<host> $$ $9 $<nope>', true).text).toBe('site/me [me@site] site $ $9  x')
+    expect(replaceInText('me@site', regex, "pre:$` post:$'", true).text).toBe('pre: post:')
+    expect(replaceInText('me@site', buildSearchRegex({ query: 'me@site' }), '$1 $&', false).text).toBe('$1 $&')
   })
 })
 

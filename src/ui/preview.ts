@@ -4,6 +4,25 @@ import { buildPreview } from '../runner/html'
 import type { ConsoleLevel, PreviewMessage } from '../runner/protocol'
 import { h, iconButton } from './dom'
 
+const PREVIEW_SANDBOX = 'allow-scripts allow-modals allow-forms allow-popups allow-pointer-lock allow-downloads'
+
+const CONSOLE_LEVELS: ReadonlySet<string> = new Set<ConsoleLevel>(['log', 'info', 'warn', 'error', 'debug'])
+
+/** Shortcuts the preview may forward: navigation and layout only, nothing that saves or runs. */
+const FORWARDED_KEYS = new Set(
+  ['Ctrl', 'Meta'].flatMap((mod) => [
+    `${mod}+KeyP`,
+    `${mod}+Shift+KeyP`,
+    `${mod}+Shift+KeyF`,
+    `${mod}+Shift+KeyE`,
+    `${mod}+KeyB`,
+    `${mod}+KeyJ`,
+    `${mod}+Backquote`,
+  ]).concat(['F1']),
+)
+
+const escapeHtml = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;')
+
 export interface PreviewOptions {
   fs: VirtualFS
   onConsole: (level: ConsoleLevel, text: string) => void
@@ -48,13 +67,25 @@ export class PreviewPane {
       this.reloadTimer = setTimeout(() => void this.reload(false), 300)
     })
 
-    window.addEventListener('message', (event: MessageEvent<PreviewMessage & { type?: string; path?: string } & KeyboardEventInit>) => {
+    // Messages come from untrusted page code: check every field, and only forward key
+    // presses that cannot change the project (no Save, no Run: a page could fake them in a loop).
+    window.addEventListener('message', (event: MessageEvent<unknown>) => {
       if (!this.frame || event.source !== this.frame.contentWindow) return
-      const data = event.data
-      if (data?.source !== 'some-ide-preview') return
-      if (data.type === 'navigate' && data.path) void this.show(data.path)
-      else if (data.type === 'keydown') this.options.onKeydown(new KeyboardEvent('keydown', data))
-      else if (data.level) this.options.onConsole(data.level, data.text)
+      const data = event.data as Partial<PreviewMessage & { type: string; path: string } & KeyboardEventInit> | null
+      if (!data || typeof data !== 'object' || data.source !== 'some-ide-preview') return
+      if (data.type === 'navigate') {
+        if (typeof data.path === 'string' && options.fs.isFile(data.path)) void this.show(data.path)
+      } else if (data.type === 'keydown') {
+        if (document.activeElement !== this.frame || typeof data.code !== 'string') return
+        const binding = [data.ctrlKey && 'Ctrl', data.metaKey && 'Meta', data.shiftKey && 'Shift', data.altKey && 'Alt', data.code]
+          .filter(Boolean)
+          .join('+')
+        if (!FORWARDED_KEYS.has(binding)) return
+        const { code, key, ctrlKey, metaKey, shiftKey, altKey } = data
+        this.options.onKeydown(new KeyboardEvent('keydown', { code, key: String(key ?? ''), ctrlKey: !!ctrlKey, metaKey: !!metaKey, shiftKey: !!shiftKey, altKey: !!altKey }))
+      } else if (typeof data.level === 'string' && CONSOLE_LEVELS.has(data.level) && typeof data.text === 'string') {
+        this.options.onConsole(data.level, data.text.slice(0, 100_000))
+      }
     })
   }
 
@@ -104,10 +135,7 @@ export class PreviewPane {
     const frame = h('iframe', {
       class: 'preview-frame',
       title: `Preview of ${entry}`,
-      attrs: {
-        sandbox: 'allow-scripts allow-modals allow-forms allow-popups allow-pointer-lock allow-downloads',
-        allow: 'clipboard-write',
-      },
+      attrs: { sandbox: PREVIEW_SANDBOX, allow: 'clipboard-write' },
     })
     frame.srcdoc = html
     this.frame?.remove()
@@ -115,9 +143,22 @@ export class PreviewPane {
     this.frameHost.append(frame)
   }
 
+  /**
+   * Opens the preview in a new window. The page is wrapped in a sandboxed iframe there too:
+   * a bare blob: URL would run the project's scripts on the IDE's own origin, with access
+   * to every stored project.
+   */
   private openExternal(): void {
-    if (!this.lastHtml) return
-    const url = URL.createObjectURL(new Blob([this.lastHtml], { type: 'text/html' }))
+    if (!this.lastHtml || !this.entry) return
+    const title = `Preview of ${this.entry}`
+    const wrapper =
+      '<!DOCTYPE html><html><head><meta charset="utf-8">' +
+      `<title>${escapeHtml(title)}</title>` +
+      '<style>html,body{margin:0;height:100%}iframe{display:block;width:100%;height:100%;border:0}</style>' +
+      '</head><body>' +
+      `<iframe sandbox="${PREVIEW_SANDBOX}" title="${escapeHtml(title)}" srcdoc="${escapeHtml(this.lastHtml)}"></iframe>` +
+      '</body></html>'
+    const url = URL.createObjectURL(new Blob([wrapper], { type: 'text/html' }))
     window.open(url, '_blank', 'noopener')
     setTimeout(() => URL.revokeObjectURL(url), 60_000)
   }

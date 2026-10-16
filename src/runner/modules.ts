@@ -92,6 +92,13 @@ export function transpileModule(path: string, source: string, target: ModuleTarg
 }
 
 /**
+ * Imports whose specifier is a literal string. `import(\`./locales/${lang}.js\`)` is reported
+ * as a glob ("./locales/*.js") and must be left for the runtime to resolve.
+ */
+const isLinkable = (imp: Import): imp is Import & { specifier: string } =>
+  imp.type !== 'import-meta' && imp.specifier != null && !(imp.type === 'dynamic' && imp.glob)
+
+/**
  * Rewrites import specifiers in `code`. `map` returns the new specifier, or null to keep it.
  * JSON import attributes are dropped because JSON files are converted to JS modules.
  */
@@ -99,7 +106,7 @@ export function rewriteImports(code: string, imports: readonly Import[], map: (s
   let out = code
   const ordered = [...imports].sort((a, b) => b.start - a.start)
   for (const imp of ordered) {
-    if (imp.type === 'import-meta' || imp.specifier == null) continue
+    if (!isLinkable(imp)) continue
     const replacement = map(imp.specifier)
     if (replacement == null) continue
     const quoted = JSON.stringify(replacement)
@@ -123,10 +130,15 @@ export interface LinkOptions {
    * specifier other modules should import it by (a blob: URL, an import-map key, …).
    */
   emit: (path: string, code: string) => string
+  /**
+   * Where a bare import such as 'lodash' comes from. Defaults to esm.sh; return null to leave
+   * the specifier alone (e.g. when the page's own import map already defines it).
+   */
+  resolveBare?: (specifier: string) => string | null
 }
 
 /** Links the module graph rooted at `entry` and returns the entry's specifier. */
-export async function linkModules({ files, entry, target, emit }: LinkOptions): Promise<string> {
+export async function linkModules({ files, entry, target, emit, resolveBare }: LinkOptions): Promise<string> {
   await initLexer()
   const linked = new Map<string, string>()
   const stack: string[] = []
@@ -154,8 +166,9 @@ export async function linkModules({ files, entry, target, emit }: LinkOptions): 
     // Link dependencies in source order, then rewrite the specifiers.
     const replacements = new Map<string, string | null>()
     for (const imp of imports) {
+      if (!isLinkable(imp)) continue
       const spec = imp.specifier
-      if (spec == null || replacements.has(spec)) continue
+      if (replacements.has(spec)) continue
       if (isUrlSpecifier(spec)) {
         replacements.set(spec, null)
       } else if (isRelativeSpecifier(spec)) {
@@ -163,7 +176,7 @@ export async function linkModules({ files, entry, target, emit }: LinkOptions): 
         if (!resolved) throw new ModuleError(`Cannot find module '${spec}' imported from ${path}`)
         replacements.set(spec, visit(resolved))
       } else {
-        replacements.set(spec, ESM_CDN + spec)
+        replacements.set(spec, resolveBare ? resolveBare(spec) : ESM_CDN + spec)
       }
     }
     const rewritten = rewriteImports(code, imports, (spec) => replacements.get(spec) ?? null)

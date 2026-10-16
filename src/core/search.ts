@@ -84,3 +84,48 @@ export function searchFiles(files: Iterable<[string, string]>, options: SearchOp
   }
   return results
 }
+
+/**
+ * Replaces the matches `searchText` reports — per line, never empty — rather than everything
+ * the regex could match across the whole text (`\s+` must not join lines). `regex` must be
+ * global. With `expand`, "$1", "$&", "$<name>" etc. in `replacement` work as in
+ * String.prototype.replace; otherwise the replacement is literal.
+ */
+export function replaceInText(text: string, regex: RegExp, replacement: string, expand: boolean): { text: string; count: number } {
+  let count = 0
+  const parts = text.split(/(\r?\n)/) // line breaks are kept at the odd indices
+  for (let i = 0; i < parts.length; i += 2) {
+    parts[i] = parts[i].replace(regex, (...args: unknown[]) => {
+      const match = args[0] as string
+      if (match === '') return ''
+      count++
+      return expand ? expandReplacement(replacement, args) : replacement
+    })
+  }
+  return { text: parts.join(''), count }
+}
+
+/** Expands the "$…" patterns of String.prototype.replace from a replacer's arguments. */
+function expandReplacement(replacement: string, args: unknown[]): string {
+  const match = args[0] as string
+  const last = args[args.length - 1]
+  const groups = typeof last === 'object' && last !== null ? (last as Record<string, string | undefined>) : undefined
+  const inputIndex = groups ? args.length - 2 : args.length - 1
+  const input = args[inputIndex] as string
+  const offset = args[inputIndex - 1] as number
+  const captures = args.slice(1, inputIndex - 1) as Array<string | undefined>
+  return replacement.replace(/\$(?:(\$)|(&)|(`)|(')|<([^>]*)>|(\d{1,2}))/g, (whole, dollar, amp, before, after, name, num) => {
+    if (dollar) return '$'
+    if (amp) return match
+    if (before) return input.slice(0, offset)
+    if (after) return input.slice(offset + match.length)
+    if (name !== undefined) return groups ? (groups[name] ?? '') : whole
+    if (num !== undefined) {
+      const n = Number(num)
+      if (num.length === 2 && n >= 1 && n <= captures.length) return captures[n - 1] ?? ''
+      const d = Number(num[0])
+      if (d >= 1 && d <= captures.length) return (captures[d - 1] ?? '') + num.slice(1)
+    }
+    return whole
+  })
+}

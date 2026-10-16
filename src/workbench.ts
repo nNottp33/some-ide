@@ -57,21 +57,31 @@ export class Workbench {
     private readonly fs: VirtualFS,
     private readonly docs: DocumentManager,
     private readonly store: KeyValueStore,
+    /** False when the saved project could not be read; nothing is written then, to protect it. */
+    private readonly storageReadable: boolean,
   ) {}
 
   static async start(host: HTMLElement): Promise<Workbench> {
     configureMonaco()
     const store = await openStore()
     const fs = new VirtualFS()
-    const saved = await store.get<ProjectSnapshot>(PROJECT_KEY).catch(() => undefined)
-    const firstRun = !saved
+    // A failed read must not look like a first run: writing the sample project over a
+    // project that merely could not be read right now would destroy it.
+    let saved: ProjectSnapshot | undefined
+    let storageReadable = true
+    try {
+      saved = await store.get<ProjectSnapshot>(PROJECT_KEY)
+    } catch {
+      storageReadable = false
+    }
+    const firstRun = !saved && storageReadable
     fs.load(saved ?? sampleProject())
     if (firstRun) await store.set(PROJECT_KEY, fs.snapshot()).catch(() => {})
     const docs = new DocumentManager(fs)
-    const buffers = await store.get<Record<string, string>>(BUFFERS_KEY).catch(() => undefined)
+    const buffers = storageReadable ? await store.get<Record<string, string>>(BUFFERS_KEY).catch(() => undefined) : undefined
     if (buffers) docs.restoreBuffers(buffers)
 
-    const workbench = new Workbench(fs, docs, store)
+    const workbench = new Workbench(fs, docs, store, storageReadable)
     workbench.build(host)
     workbench.restore(firstRun)
     return workbench
@@ -456,6 +466,8 @@ export class Workbench {
     this.updateStatus()
     if (this.store.kind === 'memory') {
       notify('Browser storage is unavailable here, so files will not be kept after you close this page. Use “Download Project as .zip” to save your work.', 'warning', 10000)
+    } else if (!this.storageReadable) {
+      notify('The saved project could not be read, so this session will not be saved to protect it. Reload the page to try again, or download a .zip of this session.', 'error', 15000)
     }
   }
 
@@ -464,12 +476,21 @@ export class Workbench {
 
     // Persist the project and unsaved edits.
     const persistProject = debounce(() => {
+      if (!this.storageReadable) return
       this.store.set(PROJECT_KEY, fs.snapshot()).catch((err) => notify(`Could not save the project: ${(err as Error).message}`, 'error'))
     }, 250)
-    const persistBuffers = debounce(() => void this.store.set(BUFFERS_KEY, docs.dirtyBuffers()).catch(() => {}), 400)
+    const persistBuffers = debounce(() => {
+      if (!this.storageReadable) return
+      void this.store.set(BUFFERS_KEY, docs.dirtyBuffers()).catch(() => {})
+    }, 400)
     fs.onDidChange.on(persistProject)
     docs.onDidChangeContent.on(persistBuffers)
     docs.onDidChangeDirty.on(persistBuffers)
+    // Unsaved edits are keyed by path: re-save them when files move or disappear, or a
+    // renamed file's edits would be lost (and a deleted file's edits could resurface).
+    docs.onDidMove.on(persistBuffers)
+    docs.onDidRemove.on(persistBuffers)
+    docs.onDidReset.on(persistBuffers)
     addEventListener('pagehide', () => {
       persistProject.flush()
       persistBuffers.flush()

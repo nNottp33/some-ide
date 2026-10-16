@@ -8,6 +8,8 @@ import type { ConsoleLevel, RunnerMessage, RunRequest, WorkerScope } from './pro
 
 const scope = self as unknown as WorkerScope
 const post = (message: RunnerMessage) => scope.postMessage(message)
+// Captured before user code runs: `trackAsyncWork` replaces the global later.
+const nativeSetTimeout = setTimeout
 
 let stdinLines: string[] = []
 let groupDepth = 0
@@ -149,7 +151,7 @@ function trackAsyncWork() {
   const timeouts = new Set<unknown>()
   const intervals = new Set<unknown>()
   // Defer the check to a fresh task so promise callbacks chained by user code run first.
-  const later = () => realSetTimeout(maybeFinish, 0)
+  const later = scheduleFinish
 
   g.setTimeout = (fn: (...a: unknown[]) => void, ms?: number, ...args: unknown[]) => {
     if (fromViteClient()) return realSetTimeout(fn, ms, ...args)
@@ -187,17 +189,32 @@ function trackAsyncWork() {
     }
     realClearInterval(id)
   }
-  g.fetch = (...args: Parameters<typeof fetch>) => {
-    if (fromViteClient()) return realFetch(...args)
+  const track = <T>(promise: Promise<T>): Promise<T> => {
     pendingWork.count++
     const settle = () => {
       pendingWork.count--
       later()
     }
-    const request = realFetch(...args)
-    request.then(settle, settle)
-    return request
+    promise.then(settle, settle)
+    return promise
   }
+  g.fetch = (...args: Parameters<typeof fetch>) => (fromViteClient() ? realFetch(...args) : track(realFetch(...args)))
+  // Reading a response body is more async work: `fetch(u).then(r => r.json()).then(console.log)`
+  // must still count as running after the headers have arrived.
+  const proto = Response.prototype as unknown as Record<string, (...a: unknown[]) => Promise<unknown>>
+  for (const method of ['json', 'text', 'arrayBuffer', 'blob', 'formData', 'bytes']) {
+    const original = proto[method]
+    if (typeof original !== 'function') continue
+    proto[method] = function (this: Response, ...a: unknown[]) {
+      const result = original.apply(this, a)
+      return fromViteClient() ? result : track(result)
+    }
+  }
+}
+
+/** Runs `maybeFinish` from a fresh task, after every pending microtask (awaits, .then chains). */
+function scheduleFinish() {
+  nativeSetTimeout(maybeFinish, 0)
 }
 
 scope.onmessage = async (event: MessageEvent<RunRequest>) => {
@@ -226,5 +243,7 @@ scope.onmessage = async (event: MessageEvent<RunRequest>) => {
     pendingWork.count = 0 // like Node: an uncaught error at the top level ends the program
   }
   pendingWork.mainDone = true
-  maybeFinish()
+  // Not maybeFinish() directly: code still queued as microtasks (an async main() with many
+  // awaits) would otherwise print after "done" and be lost when the worker is terminated.
+  scheduleFinish()
 }

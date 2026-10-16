@@ -41,9 +41,13 @@ export class Explorer {
   private selected: string | null = null
   private activeFile: string | null = null
   private editing: EditState | null = null
+  /** The live input row for `editing`, kept across re-renders so typed text survives. */
+  private editRow: { state: EditState; element: HTMLElement; input: HTMLInputElement; fresh: boolean } | null = null
   private renderQueued = false
-  /** True while the tree DOM is being replaced; removing a focused input fires `blur`. */
+  /** True while the tree DOM is being rebuilt; detaching a focused input fires `blur`. */
   private rendering = false
+  /** Whether keyboard focus was in the tree when the last render started. */
+  private focusInTree = false
   private dragSource: string | null = null
 
   constructor(private readonly options: ExplorerOptions) {
@@ -194,8 +198,19 @@ export class Explorer {
   }
 
   private render(): void {
+    // Moving the input row being edited out of the live tree (while building the fragment)
+    // already fires its blur; the guard must cover the whole render, not just replaceChildren.
+    this.rendering = true
+    try {
+      this.renderTree()
+    } finally {
+      this.rendering = false
+    }
+    this.afterRender()
+  }
+
+  private renderTree(): void {
     const { fs, docs } = this.options
-    const focusInTree = this.tree.contains(document.activeElement) && !(document.activeElement instanceof HTMLInputElement)
     const fragment = document.createDocumentFragment()
     this.rows = []
     const dirtyPaths = docs.dirtyPaths()
@@ -229,18 +244,27 @@ export class Explorer {
       )
     }
 
-    this.rendering = true
-    try {
-      this.tree.replaceChildren(fragment)
-    } finally {
-      this.rendering = false
+    this.focusInTree = this.tree.contains(document.activeElement) && !(document.activeElement instanceof HTMLInputElement)
+    this.tree.replaceChildren(fragment)
+  }
+
+  private afterRender(): void {
+    const focusInTree = this.focusInTree
+    const edit = this.editRow
+    if (edit && !edit.element.isConnected) {
+      // The folder being edited in is gone (deleted or moved meanwhile): drop the edit.
+      this.editing = null
+      this.editRow = null
     }
-    const input = this.tree.querySelector<HTMLInputElement>('.tree-input')
-    if (input) {
-      input.focus()
-      // Select the name without the extension, like VS Code does.
-      const dot = input.value.lastIndexOf('.')
-      input.setSelectionRange(0, dot > 0 && this.editing?.mode === 'rename' ? dot : input.value.length)
+    if (edit?.element.isConnected) {
+      // Moving the row during replaceChildren drops focus; the text and caret are kept.
+      if (document.activeElement !== edit.input) edit.input.focus()
+      if (edit.fresh) {
+        edit.fresh = false
+        // Select the name without the extension, like VS Code does.
+        const dot = edit.input.value.lastIndexOf('.')
+        edit.input.setSelectionRange(0, dot > 0 && edit.state.mode === 'rename' ? dot : edit.input.value.length)
+      }
     } else if (focusInTree) {
       this.tree.focus()
     }
@@ -275,6 +299,12 @@ export class Explorer {
   }
 
   private inputRow(depth: number, kind: EntryKind, value: string, renaming?: string): HTMLElement {
+    // A background re-render (auto save, a dirty-state change) re-uses the row being edited
+    // instead of rebuilding it, so what is being typed is not lost.
+    if (this.editRow && this.editing && this.editRow.state === this.editing) {
+      this.editRow.element.style.paddingLeft = `${BASE_PADDING + depth * INDENT}px`
+      return this.editRow.element
+    }
     const error = h('div', { class: 'tree-input-error' })
     let done = false
     const finish = (commit: boolean) => {
@@ -292,6 +322,7 @@ export class Explorer {
         committed = true
       }
       done = true
+      this.editRow = null
       this.editing = null
       this.render()
       // A newly created file is opened in the editor, which keeps the focus.
@@ -321,13 +352,15 @@ export class Explorer {
       },
     })
     const glyph = kind === 'dir' ? folderIcon(false) : fileIcon(value || 'file.txt')
-    return h(
+    const element = h(
       'div',
       { class: 'tree-row editing', style: { paddingLeft: `${BASE_PADDING + depth * INDENT}px` } },
       h('span', { class: 'twistie' }),
       glyph,
       h('div', { class: 'tree-input-wrap' }, input, error),
     )
+    this.editRow = { state: this.editing!, element, input, fresh: true }
+    return element
   }
 
   private targetPathFor(name: string): string | null {

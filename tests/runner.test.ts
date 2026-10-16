@@ -1,6 +1,6 @@
 // @vitest-environment happy-dom
 import { describe, expect, it } from 'vitest'
-import { buildPreview } from '../src/runner/html'
+import { buildPreview, importMapDefines } from '../src/runner/html'
 import { formatArgs, formatTable, inspect } from '../src/runner/inspect'
 import { ESM_CDN, linkModules, ModuleError, resolveModulePath, transpileModule } from '../src/runner/modules'
 
@@ -106,6 +106,28 @@ describe('modules', () => {
     expect(main).toContain('//# sourceURL=/src/main.ts')
   })
 
+  it('leaves template-literal dynamic imports for the runtime', async () => {
+    const globby = new Map(files).set('/g.ts', "export const load = (l: string) => import(`./locales/${l}.js`)\nexport const other = (b: string) => import(`${b}/x.js`)\nimport('./src/math').then(console.log)")
+    const emitted: string[] = []
+    await linkModules({ files: globby, entry: '/g.ts', target: 'worker', emit: (p, code) => (emitted.push(code), `mod:${p}`) })
+    const code = emitted.at(-1)!
+    expect(code).toContain('import(`./locales/${l}.js`)')
+    expect(code).toContain('import(`${b}/x.js`)')
+    expect(code).toContain('import("mod:/src/math.ts")')
+  })
+
+  it('lets the caller decide where bare imports come from', async () => {
+    const emitted: string[] = []
+    await linkModules({
+      files,
+      entry: '/src/main.ts',
+      target: 'worker',
+      emit: (_p, code) => (emitted.push(code), 'x'),
+      resolveBare: (spec) => (spec === 'canvas-confetti' ? null : ESM_CDN + spec),
+    })
+    expect(emitted.at(-1)).toContain("from 'canvas-confetti'")
+  })
+
   it('rejects cycles and missing files', async () => {
     const link = (entry: string) => linkModules({ files, entry, target: 'worker', emit: (p) => p })
     await expect(link('/a.ts')).rejects.toThrow(/Circular imports.*\/a\.ts → \/b\.ts → \/a\.ts/)
@@ -148,6 +170,31 @@ describe('buildPreview', () => {
     expect(scripts[1]).toBe('import "@project/src/app.ts";')
     // The console/fetch bridge comes first in <head>, then the import map.
     expect(doc.head.firstElementChild?.textContent).toContain('some-ide-preview')
+  })
+
+  it("keeps the page's own import map entries", async () => {
+    const page = new Map([
+      [
+        '/index.html',
+        '<script type="importmap">{"imports":{"vue":"https://unpkg.com/vue/dist/vue.esm-browser.js","@lib/":"https://cdn.example/lib/"},"scopes":{}}</script>' +
+          '<script type="module" src="main.js"></script>',
+      ],
+      ['/main.js', "import { createApp } from 'vue'\nimport x from '@lib/x.js'\nimport _ from 'lodash'\nconsole.log(createApp, x, _)"],
+    ])
+    const { html, warnings } = await buildPreview(page, '/index.html')
+    expect(warnings).toEqual([])
+    const doc = new DOMParser().parseFromString(html, 'text/html')
+    const maps = doc.querySelectorAll('script[type="importmap"]')
+    expect(maps).toHaveLength(1)
+    const importMap = JSON.parse(maps[0].textContent!)
+    expect(importMap.imports.vue).toBe('https://unpkg.com/vue/dist/vue.esm-browser.js')
+    expect(importMap.scopes).toEqual({})
+    const main = decodeURIComponent(importMap.imports['@project/main.js'].split(',')[1])
+    expect(main).toContain("from 'vue'")
+    expect(main).toContain("from '@lib/x.js'")
+    expect(main).toContain('from "https://esm.sh/lodash"')
+    expect(importMapDefines({ 'a/': '1' }, 'a/b')).toBe(true)
+    expect(importMapDefines({ a: '1' }, 'a/b')).toBe(false)
   })
 
   it('warns about missing local files', async () => {
