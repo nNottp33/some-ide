@@ -1,0 +1,108 @@
+:root {
+  --vvh: 100vh;           /* visualViewport height, updated by JS */
+  --vv-top: 0px;          /* visualViewport offsetTop (iOS) */
+  --kb-sim: 0px;          /* simulated keyboard height */
+  --toolbar-h: 44px;
+  --keys-h: 44px;
+  --bg: #1e1e1e;
+  --bar: #2b2b2b;
+  --fg: #eee;
+  --accent: #4c8dff;
+  --font-mono: ui-monospace, "SF Mono", "Cascadia Mono", "Roboto Mono", "Noto Sans Mono", "Noto Sans Thai", Menlo, Consolas, monospace;
+}
+* { box-sizing: border-box; }
+html, body {
+  margin: 0; padding: 0; height: 100%;
+  background: var(--bg); color: var(--fg);
+  font-family: system-ui, "Noto Sans Thai", sans-serif;
+  overscroll-behavior: none;
+  -webkit-text-size-adjust: 100%;
+}
+body { overflow: hidden; }
+#app {
+  position: fixed; left: 0; right: 0;
+  top: var(--vv-top);
+  height: calc(var(--vvh) - var(--kb-sim));
+  display: flex; flex-direction: column;
+  transition: none;
+}
+#toolbar {
+  flex: 0 0 var(--toolbar-h); height: var(--toolbar-h);
+  display: flex; align-items: center; gap: 6px; padding: 0 8px;
+  background: var(--bar); border-bottom: 1px solid #000;
+  font-size: 13px; white-space: nowrap; overflow: hidden;
+}
+#toolbar .brand { font-weight: 600; margin-right: 4px; }
+#toolbar button, #toolbar select {
+  height: 30px; min-width: 44px; padding: 0 8px; border-radius: 6px;
+  border: 1px solid #444; background: #333; color: var(--fg); font-size: 13px;
+}
+#toolbar button.on { background: var(--accent); border-color: var(--accent); color: #fff; }
+#toolbar .status { margin-left: auto; opacity: .7; font-size: 11px; }
+#editor-host { flex: 1 1 auto; min-height: 0; position: relative; }
+#editor-host .cm-editor { height: 100%; } /* base theme forces position: relative !important */
+#editor-host .cm-scroller { min-height: 0; }
+#editor-host .cm-editor .cm-scroller {
+  font-family: var(--font-mono);
+  font-size: 14px;
+  line-height: 1.6; /* room for Thai tone marks above vowels */
+  -webkit-overflow-scrolling: touch;
+}
+#editor-host .cm-content { padding-bottom: 50vh; } /* lets the last lines scroll above the keyboard */
+#extra-keys {
+  flex: 0 0 var(--keys-h); height: var(--keys-h);
+  display: flex; gap: 4px; padding: 4px 6px; overflow-x: auto; overflow-y: hidden;
+  background: var(--bar); border-top: 1px solid #000;
+  scrollbar-width: none; -webkit-overflow-scrolling: touch;
+  touch-action: pan-x;
+}
+#extra-keys::-webkit-scrollbar { display: none; }
+#extra-keys button {
+  flex: 0 0 auto; min-width: 44px; height: 36px; padding: 0 10px;
+  border-radius: 6px; border: 1px solid #444; background: #3a3a3a; color: var(--fg);
+  font-size: 14px; font-family: var(--font-mono);
+  touch-action: manipulation; user-select: none; -webkit-user-select: none;
+}
+#extra-keys button:active { background: #555; }
+#extra-keys button.sticky { background: var(--accent); border-color: var(--accent); color: #fff; }
+#extra-keys button.mod { font-weight: 600; }
+
+#checklist {
+  position: fixed; top: var(--vv-top); right: 0; bottom: 0; width: min(420px, 100vw);
+  height: var(--vvh);
+  background: #222; border-left: 1px solid #000; z-index: 20;
+  overflow-y: auto; padding: 10px 12px 40px; font-size: 14px;
+}
+#checklist[hidden] { display: none; }
+#checklist h2 { font-size: 16px; margin: 4px 0 8px; display: flex; align-items: center; }
+#checklist h2 button { margin-left: auto; }
+#checklist .item { border: 1px solid #333; border-radius: 8px; padding: 8px; margin-bottom: 8px; }
+#checklist .item .title { font-weight: 600; }
+#checklist .item .desc { opacity: .8; font-size: 12px; margin: 4px 0 6px; }
+#checklist .item .row { display: flex; gap: 6px; align-items: center; }
+#checklist .item button { min-width: 44px; height: 32px; border-radius: 6px; border: 1px solid #444; background: #333; color: var(--fg); }
+#checklist .item button.sel-pass { background: #2e7d32; border-color: #2e7d32; color: #fff; }
+#checklist .item button.sel-fail { background: #c62828; border-color: #c62828; color: #fff; }
+#checklist .item button.sel-skip { background: #555; color: #fff; }
+#checklist .item input { flex: 1; min-width: 0; height: 32px; background: #1a1a1a; border: 1px solid #444; color: var(--fg); border-radius: 6px; padding: 0 6px; }
+#checklist .actions { display: flex; gap: 6px; margin: 8px 0; flex-wrap: wrap; }
+#checklist .actions button { height: 36px; padding: 0 10px; border-radius: 6px; border: 1px solid #444; background: #333; color: var(--fg); }
+#checklist textarea { width: 100%; height: 160px; background: #1a1a1a; color: var(--fg); border: 1px solid #444; font-family: var(--font-mono); font-size: 11px; }
+#checklist .device { font-size: 11px; opacity: .7; white-space: pre-wrap; margin-bottom: 8px; }
+#toast {
+  position: fixed; left: 50%; bottom: calc(var(--keys-h) + 12px + var(--kb-sim)); transform: translateX(-50%);
+  background: #000c; color: #fff; padding: 6px 12px; border-radius: 8px; font-size: 13px; z-index: 30;
+}
+#toast[hidden] { display: none; }
+@media (prefers-color-scheme: light) {
+  :root { --bg: #fafafa; --bar: #ececec; --fg: #222; }
+  #toolbar button, #toolbar select, #extra-keys button { background: #fff; border-color: #ccc; color: #222; }
+  #checklist { background: #f4f4f4; }
+  #checklist .item button, #checklist .actions button { background: #fff; border-color: #ccc; color: #222; }
+  #checklist .item input, #checklist textarea { background: #fff; border-color: #ccc; color: #222; }
+}
+@media (max-width: 520px) {
+  #toolbar .brand { display: none; }
+  #toolbar .status { font-size: 10px; }
+  #toolbar button, #toolbar select { min-width: 40px; padding: 0 6px; }
+}

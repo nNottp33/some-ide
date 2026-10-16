@@ -82,12 +82,15 @@ apps/classic/                 แอปเว็บ (Vite + Monaco)
   src/editor/                 ตั้งค่า Monaco, DocumentManager (model ต่อไฟล์ + dirty state), EditorArea (แท็บ)
   src/ui/                     explorer, search, console, problems, preview, quick input, dialogs
   src/workbench.ts            ประกอบทุกส่วน: layout, คำสั่ง, คีย์ลัด, การบันทึก
+apps/mobile-spike/            P0 spike: CodeMirror 6 เป็น editor มือถือ (ตัดคำไทย, extra keys, checklist สำหรับทดสอบบนเครื่องจริง)
 packages/runtime-core/        @some/runtime-core — ไม่มี DOM framework, ใช้ได้ทั้งเว็บ, desktop และมือถือ
   src/core/                   ระบบไฟล์เสมือน (vfs), path, search, fuzzy, zip, languages
   src/runner/                 module linker, JS worker, Python worker, HTML preview builder, console formatter
   tests/                      unit tests (Vitest)
+packages/somed/               ต้นแบบ daemon บนเครื่องผู้ใช้: PTY + blocks (OSC 633) + WebSocket/TLS + จับคู่อุปกรณ์ (ดู README ในแพ็กเกจ)
 e2e/                          end-to-end tests (Playwright) ของแอป Classic
 docs/PLAN.md                  แผนสถาปัตยกรรมและ roadmap ของรุ่น desktop/มือถือ
+docs/spikes/                  ผลการพิสูจน์ความเสี่ยง (P0 spikes)
 ```
 
 ## ทดสอบ (Tests)

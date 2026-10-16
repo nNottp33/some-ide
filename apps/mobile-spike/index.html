@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover, interactive-widget=resizes-content" />
+  <meta name="color-scheme" content="dark light" />
+  <title>CM6 Thai Spike</title>
+  <link rel="stylesheet" href="/src/style.css" />
+</head>
+<body>
+  <div id="app">
+    <header id="toolbar">
+      <span class="brand">CM6 Thai spike</span>
+      <select id="lang" title="Sample">
+        <option value="ts">TS sample</option>
+        <option value="py">Python sample</option>
+      </select>
+      <button id="wrap" title="Toggle line wrapping">Wrap</button>
+      <button id="kbsim" title="Simulate a 300px soft keyboard">KB sim</button>
+      <button id="checklist-btn" title="Device checklist">Checklist</button>
+      <span id="status" class="status"></span>
+    </header>
+    <main id="editor-host"></main>
+    <nav id="extra-keys" aria-label="Extra keys"></nav>
+  </div>
+  <aside id="checklist" hidden></aside>
+  <div id="toast" hidden></div>
+  <script type="module" src="/src/main.ts"></script>
+</body>
+</html>

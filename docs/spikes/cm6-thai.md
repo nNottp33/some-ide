@@ -10,7 +10,7 @@
   harness มี checklist 17 ข้อในตัวสำหรับทดสอบบนโทรศัพท์ (เปิดผ่าน LAN ด้วย `npm run dev -- --host`)
 - ข้อสังเกต: Backspace บน Android UA ลบทั้ง cluster (ดี) ส่วน desktop ลบทีละ code point — เป็นพฤติกรรมของเบราว์เซอร์ ต้องยืนยันบนเครื่อง
 
-harness จะถูกย้ายเข้า repo เป็น `apps/mobile-spike` (ตอนนี้อยู่ใน scratchpad ของ session) รายงานฉบับเต็มภาษาอังกฤษอยู่ด้านล่าง
+harness อยู่ใน repo ที่ `apps/mobile-spike` (`npm run dev -w apps/mobile-spike -- --host` แล้วเปิด URL บนโทรศัพท์ในวง LAN เดียวกัน; path `scratchpad/cm6-thai-spike/` ในรายงานด้านล่างคือที่เดิมตอนทดสอบ) รายงานฉบับเต็มภาษาอังกฤษอยู่ด้านล่าง
 
 ---
 

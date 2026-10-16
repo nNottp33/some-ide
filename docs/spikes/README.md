@@ -7,11 +7,11 @@
 | 0 | แก้บั๊ก 9 ข้อของ some-ide (ฐานของแอปมือถือ) | cloud session | ✅ เสร็จ — commits `51d268a`, `c0cd091` ผ่าน unit 33 / e2e 10 และรีวิวแบบ adversarial | — |
 | 0 | จัดโครง monorepo (`apps/classic`, `packages/runtime-core`) | cloud session | ✅ เสร็จ — commit `523cf1a` | — |
 | 1 | Code-OSS 1.141 build ได้พร้อม `product.json` overlay (ชื่อเรา + Open VSX) | cloud session (Linux, 4 CPU, 15 GB) | 🔄 กำลังทำ | `code-oss-build.md` |
-| 2 | ต้นแบบ `somed`: PTY + shell integration ของ VS Code (OSC 633) + block events + WebSocket + จับคู่ด้วย Ed25519 | `packages/somed` | 🔄 กำลังทำ | `packages/somed/README.md` |
-| 3 | CodeMirror 6 บนมือถือ: ข้อความไทย, extra-keys, ประสิทธิภาพไฟล์ใหญ่ | harness (จะย้ายเข้า `apps/mobile-spike`) | ✅ ผ่าน 33/33 บน Chromium desktop + Pixel 7 emulation — ใช้ได้ โดยต้องมี Thai word extension; IME จริงต้องทดสอบบนเครื่อง (checklist 17 ข้อใน harness) | [`cm6-thai.md`](cm6-thai.md) |
+| 2 | ต้นแบบ `somed`: PTY + shell integration ของ VS Code (OSC 633) + block events + WebSocket/TLS + จับคู่ด้วย Ed25519 + persist/replay | `packages/somed` | ✅ เสร็จ — 17 ลำดับคำสั่งบน bash จริงถูกต้องทั้งหมด (+ unit อื่น รวม 72 tests), Enter→block.start ≈ 6 ms, `seq 100000` ครบใน 0.6 s, RSS ≈ 96 MiB; zsh/fish/pwsh ยังไม่ได้ทดสอบ (ไม่ได้ติดตั้ง) | [`../../packages/somed/README.md`](../../packages/somed/README.md) |
+| 3 | CodeMirror 6 บนมือถือ: ข้อความไทย, extra-keys, ประสิทธิภาพไฟล์ใหญ่ | [`apps/mobile-spike`](../../apps/mobile-spike) (`npm run dev -w apps/mobile-spike -- --host` แล้วเปิดบนโทรศัพท์) | ✅ ผ่าน 33/33 บน Chromium desktop + Pixel 7 emulation — ใช้ได้ โดยต้องมี Thai word extension; IME จริงต้องทดสอบบนเครื่อง (checklist 17 ข้อใน harness) | [`cm6-thai.md`](cm6-thai.md) |
 | 3 | ข้อความไทยบน Monaco (desktop) | cloud session | ✅ เสร็จ | [`thai-monaco-desktop.md`](thai-monaco-desktop.md) |
 | 4 | Android: `forkpty` ของ `/system/bin/sh` + zsh ที่ bundle เป็น `.so` ใต้กฎ W^X | ต้องใช้ Android SDK/NDK + เครื่องจริง | ⏳ ยังไม่เริ่ม — ทำบนเครื่องของผู้พัฒนา | — |
-| 5 | จับคู่โทรศัพท์-โน้ตบุ๊ก (QR + device key + TLS) | ส่วนหนึ่งของ #2 (ฝั่ง daemon) + ต้องมีแอปมือถือ | 🔄 ฝั่ง daemon กำลังทำ | — |
+| 5 | จับคู่โทรศัพท์-โน้ตบุ๊ก (QR + device key + TLS) | ฝั่ง daemon อยู่ใน #2; ฝั่งแอปมือถือยังไม่มี | ✅ ฝั่ง daemon: รหัส 6 หลัก (หมดอายุ 5 นาที, 5 ครั้ง, ใช้ครั้งเดียว) + Ed25519 challenge/response + TLS self-signed พร้อม fingerprint pinning — ทดสอบด้วย client ตัวอย่างแล้ว; QR และแอปมือถือเป็นงาน P1 | — |
 | 1b | แผนที่ API ภายใน VS Code ที่ `terminalContrib/blocks` ต้องใช้ + จุดเปราะ 10 ข้อ | cloud session (อ่าน source 1.141.0) | ✅ เสร็จ | [`vscode-terminal-api-map.md`](vscode-terminal-api-map.md) |
 | — | ตรวจว่า basedpyright, clangd, CodeLLDB, debugpy, Jupyter มีบน Open VSX | ต้องทำจากเครื่องที่เข้า open-vsx.org ได้ (cloud session เข้าไม่ได้) | ⏳ ยังไม่เริ่ม | — |
 
