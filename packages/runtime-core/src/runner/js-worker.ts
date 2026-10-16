@@ -195,8 +195,14 @@ function trackAsyncWork() {
       pendingWork.count--
       later()
     }
-    promise.then(settle, settle)
-    return promise
+    // A derived promise, so a rejection nobody handles is still reported as unhandled.
+    return promise.then(
+      (value) => (settle(), value),
+      (error: unknown) => {
+        settle()
+        throw error
+      },
+    )
   }
   g.fetch = (...args: Parameters<typeof fetch>) => (fromViteClient() ? realFetch(...args) : track(realFetch(...args)))
   // Reading a response body is more async work: `fetch(u).then(r => r.json()).then(console.log)`

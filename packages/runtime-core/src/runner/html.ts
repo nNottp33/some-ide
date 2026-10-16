@@ -158,6 +158,19 @@ export async function buildPreview(files: ReadonlyMap<string, string>, entry: st
     return key
   }
 
+  // A map value naming a project file ("vue": "./vendor/vue.js") would 404 inside the
+  // sandboxed frame, so such entries are linked like any other project module.
+  for (const [name, value] of Object.entries(userImports)) {
+    if (typeof value !== 'string' || !value || isUrlSpecifier(value) || value.startsWith('//')) continue
+    if (name.endsWith('/')) {
+      warnings.push(`${entry}: import map prefix "${name}" points into the project; only exact entries are supported`)
+      continue
+    }
+    const path = localPath(value)
+    if (!path) continue
+    userImports[name] = importMap[await linkModules({ files, entry: path, target: 'browser', emit, resolveBare })]
+  }
+
   for (const link of [...doc.querySelectorAll('link[rel~="stylesheet"][href]')]) {
     const path = localPath(link.getAttribute('href'))
     if (!path) continue

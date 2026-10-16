@@ -177,10 +177,11 @@ describe('buildPreview', () => {
     const page = new Map([
       [
         '/index.html',
-        '<script type="importmap">{"imports":{"vue":"https://unpkg.com/vue/dist/vue.esm-browser.js","@lib/":"https://cdn.example/lib/"},"scopes":{}}</script>' +
+        '<script type="importmap">{"imports":{"vue":"https://unpkg.com/vue/dist/vue.esm-browser.js","@lib/":"https://cdn.example/lib/","local":"./vendor/local.ts"},"scopes":{}}</script>' +
           '<script type="module" src="main.js"></script>',
       ],
-      ['/main.js', "import { createApp } from 'vue'\nimport x from '@lib/x.js'\nimport _ from 'lodash'\nconsole.log(createApp, x, _)"],
+      ['/main.js', "import { createApp } from 'vue'\nimport x from '@lib/x.js'\nimport _ from 'lodash'\nimport local from 'local'\nconsole.log(createApp, x, _, local)"],
+      ['/vendor/local.ts', 'const n: number = 1\nexport default n'],
     ])
     const { html, warnings } = await buildPreview(page, '/index.html')
     expect(warnings).toEqual([])
@@ -190,6 +191,9 @@ describe('buildPreview', () => {
     const importMap = JSON.parse(maps[0].textContent!)
     expect(importMap.imports.vue).toBe('https://unpkg.com/vue/dist/vue.esm-browser.js')
     expect(importMap.scopes).toEqual({})
+    // A project-relative map value is linked (and transpiled) instead of left to 404.
+    expect(importMap.imports.local).toMatch(/^data:text\/javascript/)
+    expect(decodeURIComponent(importMap.imports.local.split(',')[1])).toContain('const n = 1')
     const main = decodeURIComponent(importMap.imports['@project/main.js'].split(',')[1])
     expect(main).toContain("from 'vue'")
     expect(main).toContain("from '@lib/x.js'")

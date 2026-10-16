@@ -61,6 +61,11 @@ export class Workbench {
     private readonly storageReadable: boolean,
   ) {}
 
+  /** Whether this session's files survive closing the page. */
+  private get persists(): boolean {
+    return this.store.kind !== 'memory' && this.storageReadable
+  }
+
   static async start(host: HTMLElement): Promise<Workbench> {
     configureMonaco()
     const store = await openStore()
@@ -497,7 +502,7 @@ export class Workbench {
       saveWorkbenchState(this.state)
     })
     addEventListener('beforeunload', (e) => {
-      if (this.store.kind === 'memory' && fs.fileCount) e.preventDefault()
+      if (!this.persists && fs.fileCount) e.preventDefault()
     })
 
     // Auto save.
@@ -712,7 +717,7 @@ export class Workbench {
     this.runner.stop()
     this.preview.hide()
     this.fs.load(snapshot)
-    void this.store.set(BUFFERS_KEY, {})
+    if (this.storageReadable) void this.store.set(BUFFERS_KEY, {})
     const first = ['/README.md', '/src/main.ts'].filter((p) => this.fs.isFile(p))
     this.editors.restore(first, first[first.length - 1] ?? null)
   }
@@ -953,9 +958,13 @@ export class Workbench {
     this.status.indent.hidden = !path
     this.status.encoding.hidden = !path
     this.status.eol.hidden = !path
-    const storage = { indexeddb: 'Saved in browser', localstorage: 'Saved in browser', memory: 'Not saved (no storage)' }[this.store.kind]
-    this.status.storage.replaceChildren(icon(this.store.kind === 'memory' ? 'warning' : 'database'), h('span', {}, storage))
-    this.status.storage.title = this.store.kind === 'memory' ? 'Browser storage is unavailable' : `Files are stored in this browser (${this.store.kind})`
+    const storage = !this.storageReadable ? 'Not saved (storage unreadable)' : this.store.kind === 'memory' ? 'Not saved (no storage)' : 'Saved in browser'
+    this.status.storage.replaceChildren(icon(this.persists ? 'database' : 'warning'), h('span', {}, storage))
+    this.status.storage.title = !this.storageReadable
+      ? 'The saved project could not be read; nothing is written until the page is reloaded'
+      : this.store.kind === 'memory'
+        ? 'Browser storage is unavailable'
+        : `Files are stored in this browser (${this.store.kind})`
     this.updateCursorStatus()
     this.updateProblemsStatus()
     this.updateRunButton()
