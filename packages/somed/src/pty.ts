@@ -132,6 +132,8 @@ export interface SpawnShellOptions {
   login?: boolean
   /** Disable shell integration injection (plain shell). */
   noShellIntegration?: boolean
+  /** The user's own ZDOTDIR (zsh); defaults to $ZDOTDIR or the home directory. */
+  userZdotdir?: string
 }
 
 export interface SpawnedShell {
@@ -166,7 +168,7 @@ export function spawnShell(options: SpawnShellOptions = {}): SpawnedShell {
   let args = options.args ?? []
   const injection = options.noShellIntegration
     ? ({ type: 'failure', reason: 'unsupported-args' } as const)
-    : getShellIntegrationInjection(executable, args, { nonce, login: options.login })
+    : getShellIntegrationInjection(executable, args, { nonce, login: options.login, userZdotdir: options.userZdotdir })
   if (injection.type === 'injection') {
     args = injection.newArgs
     Object.assign(baseEnv, injection.envMixin)
