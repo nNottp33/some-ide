@@ -296,13 +296,15 @@ export class BlockDetector {
     for (let y = startLine; y <= cursorLine; y++) {
       const line = buf.getLine(y)
       if (!line) break
+      const continuation = this.#continuations.find((c) => c.marker.line === y && c.toX > c.fromX)
+      // A line belongs to the typed command only if it wraps from the previous one or starts with a
+      // continuation prompt (PS2). Anything else (e.g. type-ahead echoed by the tty) is not the command.
+      if (y > startLine && !line.isWrapped && !continuation) break
       const next = buf.getLine(y + 1)
       const continues = y < cursorLine && next?.isWrapped === true
       let text =
         y === cursorLine ? line.translateToString(true, 0, buf.cursorX) : line.translateToString(!continues, 0)
-      for (const c of this.#continuations) {
-        if (c.marker.line === y && c.toX > c.fromX) text = text.slice(0, c.fromX) + text.slice(c.toX)
-      }
+      if (continuation) text = text.slice(0, continuation.fromX) + text.slice(continuation.toX)
       if (y === startLine) text = text.slice(this.#inputX)
       parts.push(text)
       if (y < cursorLine && !continues) parts.push('\n')
