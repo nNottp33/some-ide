@@ -1,0 +1,19 @@
+{
+  "name": "@some/somed",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Per-user host daemon: PTY sessions with shell-integration based block detection, served over WebSocket to the IDE.",
+  "bin": {
+    "somed": "./src/cli.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "serve": "node src/cli.ts serve"
+  },
+  "dependencies": {
+    "@xterm/headless": "^6.0.0",
+    "node-pty": "^1.1.0",
+    "ws": "^8.22.0"
+  }
+}
