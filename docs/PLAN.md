@@ -4,7 +4,7 @@
 | --- | --- |
 | เอกสาร | Product / architecture plan (codename `some-ide`) |
 | เวอร์ชัน | 1.0 — 2026-10-16 |
-| สถานะ | ทางเลือกหลักตัดสินแล้ว (ดู §12) — รอเริ่ม P0 |
+| สถานะ | ทางเลือกหลักตัดสินแล้ว (ดู §12) — P0 กำลังดำเนินการตั้งแต่ 2026-10-16 (ดู [spikes/README.md](spikes/README.md)) |
 | ผู้อ่าน | นักพัฒนาที่จะลงมือสร้าง (solo หรือทีมเล็ก) |
 | แหล่งข้อมูล | รอบวางแผนที่ 1 (desktop-only, 2026-10-09) และรอบที่ 2 (ทุกแพลตฟอร์ม + Warp terminal, 2026-10-11) พร้อมผล fact-check ของแต่ละรอบ (§13) |
 
@@ -319,6 +319,8 @@ WEB: somed-served Full workbench  |  some-ide static "Lite" (no backend)
 
 สถานะ repo (ตรวจในเครื่องเมื่อ 2026-10-09): `/home/user/some-ide`, TypeScript 5,374 บรรทัดใน `src/**/*.ts` (5,898 บรรทัดเมื่อรวม tests/, e2e/ และ config), monaco-editor ^0.57, typescript ^7.0.2, vite ^8.3.4, vitest ^5, @playwright/test ^1.64; breakpoint โทรศัพท์ `NARROW = 720` ใน `src/workbench.ts`; `e2e/mobile.spec.ts` ขับ viewport Pixel 7; `src/runner/py-worker.ts` โหลด Pyodide 314.0.7 จาก cdn.jsdelivr.net
 
+หมายเหตุ 2026-10-16: repo ถูกจัดเป็น workspace แล้ว — โค้ดใน `src/core/{vfs,path,emitter,search,fuzzy,zip,languages}.ts` และ `src/runner/*` ย้ายไป `packages/runtime-core/src/` (แพ็กเกจ `@some/runtime-core`) ส่วนที่เหลือของแอปอยู่ใน `apps/classic/src/`; path ในตารางด้านล่างอ้างอิงโครงสร้างเดิม
+
 หลักการ: some-ide **ยังอยู่** ในฐานะ Web "Lite" edition ฟรี และถูก "ขุด" ไปใช้ในแอป mobile และ desktop runner extension; ประมาณ **60–70% ของโค้ดที่ไม่ใช่ editor** ถูกใช้ซ้ำ (รอบที่ 1 ซึ่งเป็น desktop-only ประเมินไว้แค่ 35–45% เพราะไม่มี mobile client ที่จะรับ UI ไป)
 
 ### 9.1 ใช้ซ้ำตรง ๆ หรือ refactor เล็กน้อยในแอป mobile
@@ -348,7 +350,7 @@ WEB: somed-served Full workbench  |  some-ide static "Lite" (no backend)
 - `src/workbench.ts` (~1,000 บรรทัด) ถูกแยก: logic layout/panel/tab ไปเลี้ยง mobile workbench-lite ส่วนที่ผูกกับ Monaco ตัดทิ้ง
 - `src/editor/*` (`monaco.ts`, `documents.ts`, `editor-area.ts`) ไม่ใช้บน desktop เพราะ desktop คือ workbench ของ VS Code เอง; บน mobile แนวคิด `DocumentManager` ถูก re-target ไป CodeMirror 6 `EditorState` และ custom Monaco themes แทนด้วย VS Code theme JSON
 
-### 9.4 Bug จาก review ที่เปิดอยู่ 9 รายการ — กำลังแก้ใน P0
+### 9.4 Bug จาก review 9 รายการ — แก้แล้ว 2026-10-16 (commits `51d268a`, `c0cd091`; ผ่าน unit/e2e และรีวิวแบบ adversarial)
 
 โค้ดชุดนี้จะกลายเป็นฐานของแอป mobile จึงต้องแก้ก่อนเริ่ม refactor:
 
